@@ -1,0 +1,54 @@
+# ===== Секреты =====
+.env
+.env.*
+!.env.example
+*.key
+*.pem
+credentials*
+secrets/
+
+# ===== Данные: всё в data/ игнорируем, кроме эталонов =====
+data/*
+!data/samples/
+!data/README.md
+*.aux.xml
+*.ovr
+*.tmp
+*.SAFE/
+*.jp2
+output/
+outputs/
+cache/
+tmp/
+
+# ===== Python =====
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+env/
+*.egg-info/
+build/
+dist/
+.pytest_cache/
+.ruff_cache/
+.mypy_cache/
+.coverage
+htmlcov/
+.ipynb_checkpoints/
+
+# ===== Фронтенд =====
+node_modules/
+.next/
+.parcel-cache/
+.vite/
+npm-debug.log*
+yarn-error.log*
+
+# ===== IDE / ОС / Office =====
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
+*.swp
+~$*
