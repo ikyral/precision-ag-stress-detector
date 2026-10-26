@@ -19,6 +19,7 @@ from typing import Mapping, Sequence
 
 import numpy as np
 
+from .filters import core_mask
 from .early_stress import EarlyStressConfig, EarlyStressResult, detect_hidden_stress, evaluate_alert
 from .geotiff_io import GeoMeta, read_geotiff, write_geotiff
 from .indices import INDEX_NAMES, compute_indices, valid_mask
@@ -109,7 +110,11 @@ def analyze_scene(
 
     indices = compute_indices(bands, INDEX_NAMES, backend=backend)
     valid = valid_mask(bands, INDEX_NAMES)
-    early = detect_hidden_stress(indices["NDRE"], indices["NDVI"], early_cfg, prev=prev_anomalies)
+    core = core_mask(valid, early_cfg.edge_buffer_px)  # краевой пояс (смешанные пиксели) не ищем
+    early = detect_hidden_stress(
+        np.where(core, indices["NDRE"], np.nan), np.where(core, indices["NDVI"], np.nan),
+        early_cfg, prev=prev_anomalies,
+    )
     zoning = segment_zones(indices, zoning_cfg)
 
     area = geo.pixel_area_m2
