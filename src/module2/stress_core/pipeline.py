@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import json
 import re
+import sys
 from dataclasses import asdict, dataclass
 from datetime import datetime, timezone
 from pathlib import Path
@@ -19,9 +20,9 @@ from typing import Mapping, Sequence
 
 import numpy as np
 
+from .early_stress import EarlyStressConfig, EarlyStressResult, anomalies, detect_hidden_stress, evaluate_alert
 from .filters import core_mask
-from .early_stress import EarlyStressConfig, EarlyStressResult, detect_hidden_stress, evaluate_alert
-from .geotiff_io import GeoMeta, read_geotiff, write_geotiff
+from .geotiff_io import GeoMeta, read_geotiff, read_geotiff_meta, write_geotiff
 from .indices import INDEX_NAMES, compute_indices, valid_mask
 from .stats import hidden_stress_stats, index_stats, zone_stats
 from .zoning import ZoningConfig, ZoningResult, segment_zones
@@ -30,6 +31,12 @@ SCHEMA_VERSION = "1.1"
 DEFAULT_BAND_ORDER = ("R", "RE1", "N", "S1")
 # порядок каналов sample_scene.tif / scene_YYYY_MM_DD.tif от модуля 1 (см. data/README.md)
 SENTINEL2_10_BAND_ORDER = ("B", "G", "R", "RE1", "RE2", "RE3", "N", "N2", "S1", "S2")
+# каналы Sentinel-2 -> обозначения каталога Awesome Spectral Indices
+S2_TO_ASI = {
+    "B01": "A", "B02": "B", "B03": "G", "B04": "R", "B05": "RE1", "B06": "RE2", "B07": "RE3",
+    "B08": "N", "B8A": "N2", "B09": "WV", "B11": "S1", "B12": "S2",
+}
+ASI_BAND_NAMES = frozenset(S2_TO_ASI.values())
 INDEX_FILE_NAME = {"NDVI": "NDVI", "NDRE": "NDRE", "MSAVI2": "MSAVI", "NDMI": "NDMI"}  # имена по ТЗ
 _DATE_RE = re.compile(r"(\d{4})[-_]?(\d{2})[-_]?(\d{2})")
 
@@ -41,28 +48,119 @@ def parse_date(name: str) -> str:
     return f"{m.group(1)}-{m.group(2)}-{m.group(3)}"
 
 
-def load_scene(
-    path: str | Path,
-    band_order: Sequence[str] = DEFAULT_BAND_ORDER,
-    scale: float | None = None,
-) -> tuple[dict[str, np.ndarray], GeoMeta]:
-    """Читает GeoTIFF и возвращает каналы как отражение 0..1 (NaN — нет данных).
+def scene_date(path: str | Path, meta: GeoMeta | None = None) -> str | None:
+    """Дата сцены: из имени файла, иначе из тега GDAL 'date' (его пишет M1). None, если даты нет."""
+    try:
+        return parse_date(Path(path).name)
+    except ValueError:
+        pass
+    try:
+        meta = meta or read_geotiff_meta(path)
+    except Exception:
+        return None
+    tag = meta.tags.get("date") or meta.tags.get("DATE")
+    try:
+        return parse_date(tag) if tag else None
+    except ValueError:
+        return None
 
-    scale — делитель DN. По умолчанию 10000 для целочисленных файлов и 1 для float.
+
+def _asi_band_name(name: str) -> str | None:
+    """'B05', 'B5', 'B05_20m', 'b8a' -> обозначение ASI ('RE1', 'N2'); имена ASI ('RE1') возвращаются как есть."""
+    raw = name.strip()
+    if raw in ASI_BAND_NAMES:
+        return raw
+    code = raw.upper().split("_")[0]
+    m = re.fullmatch(r"B0*(\d{1,2})(A?)", code)
+    if not m:
+        return None
+    return S2_TO_ASI.get(f"B{int(m.group(1)):02d}{m.group(2)}" if not m.group(2) else f"B{int(m.group(1))}A")
+
+
+def resolve_band_order(
+    n_bands: int, band_order: Sequence[str] | None, band_names: Sequence[str] | None
+) -> tuple[str, ...]:
+    """Порядок каналов сцены в обозначениях ASI.
+
+    band_order=None — определить автоматически: по описаниям каналов в файле (B02, B03, ...), иначе
+    10 каналов = формат M1 (B,G,R,RE1,RE2,RE3,N,N2,S1,S2), 4 канала = R,RE1,N,S1. Заданный band_order должен
+    совпадать с числом каналов и с описаниями в файле, иначе ошибка: перепутанные каналы молча дают неверные индексы.
     """
-    arr, geo = read_geotiff(path)
-    if arr.shape[0] < len(band_order):
+    from_meta = None
+    if band_names and len(band_names) == n_bands:
+        mapped = [_asi_band_name(b) for b in band_names]
+        if all(mapped) and len(set(mapped)) == len(mapped):
+            from_meta = tuple(mapped)
+
+    if band_order is None:
+        if from_meta:
+            return from_meta
+        if n_bands == len(SENTINEL2_10_BAND_ORDER):
+            return SENTINEL2_10_BAND_ORDER
+        if n_bands == len(DEFAULT_BAND_ORDER):
+            return DEFAULT_BAND_ORDER
         raise ValueError(
-            f"{path}: в файле {arr.shape[0]} каналов, а band_order требует {len(band_order)}"
+            f"в файле {n_bands} каналов без описаний: укажите порядок каналов (--bands), например R,RE1,N,S1"
         )
+    band_order = tuple(band_order)
+    if len(band_order) != n_bands:
+        raise ValueError(
+            f"в файле {n_bands} каналов, а задано {len(band_order)} ({','.join(band_order)}). "
+            "Для 10-канальных сцен M1 укажите --bands s2-10 или не указывайте --bands"
+        )
+    if from_meta and from_meta != band_order:
+        raise ValueError(
+            f"заданный порядок каналов {','.join(band_order)} не совпадает с описаниями в файле "
+            f"({','.join(band_names)} = {','.join(from_meta)}); уберите --bands, чтобы взять порядок из файла"
+        )
+    return band_order
+
+
+def _auto_scale(arr: np.ndarray, nodata: float | None) -> float:
+    """Делитель DN -> отражение: 10000 для целых; для float — 10000, если значения явно не 0..1."""
+    if arr.dtype.kind in "iu":
+        return 10_000.0
+    vals = arr[np.isfinite(arr)]
+    if nodata is not None and np.isfinite(nodata):
+        vals = vals[vals != nodata]
+    vals = vals[vals > 0]
+    if vals.size and float(np.percentile(vals, 99)) > 5.0:
+        return 10_000.0
+    return 1.0
+
+
+def read_scene(
+    path: str | Path,
+    band_order: Sequence[str] | None = None,
+    scale: float | None = None,
+) -> tuple[dict[str, np.ndarray], GeoMeta, dict]:
+    """Читает сцену: каналы как отражение 0..1 (NaN — нет данных), геопривязка и сведения о разборе."""
+    arr, geo = read_geotiff(path)
+    order = resolve_band_order(arr.shape[0], band_order, geo.band_names)
+    factor = float(scale) if scale is not None else _auto_scale(arr, geo.nodata)
     bands = {}
-    for i, name in enumerate(band_order):
+    for i, name in enumerate(order):
         raw = arr[i]
-        factor = scale if scale is not None else (10_000.0 if raw.dtype.kind in "iu" else 1.0)
         band = raw.astype(np.float64)
         if geo.nodata is not None:
             band[raw == geo.nodata] = np.nan
         bands[name] = band / factor
+    info = {
+        "band_order": list(order),
+        "band_names_in_file": list(geo.band_names) if geo.band_names else None,
+        "scale": factor,
+        "dtype": str(arr.dtype),
+    }
+    return bands, geo, info
+
+
+def load_scene(
+    path: str | Path,
+    band_order: Sequence[str] | None = None,
+    scale: float | None = None,
+) -> tuple[dict[str, np.ndarray], GeoMeta]:
+    """Как read_scene, но без сведений о разборе."""
+    bands, geo, _ = read_scene(path, band_order, scale)
     return bands, geo
 
 
@@ -90,6 +188,12 @@ class SceneResult:
     record: dict
 
 
+def _mean(a: np.ndarray) -> float | None:
+    v = np.asarray(a, dtype=np.float64)
+    v = v[np.isfinite(v)]
+    return round(float(v.mean()), 6) if v.size else None
+
+
 def analyze_scene(
     date: str,
     bands: dict[str, np.ndarray],
@@ -98,12 +202,13 @@ def analyze_scene(
     early_cfg: EarlyStressConfig | None = None,
     prev_anomalies: tuple[np.ndarray, np.ndarray] | None = None,
     backend: str = "numpy",
-    prev_means: tuple[float | None, float | None] | None = None,
+    prev_indices: tuple[np.ndarray, np.ndarray] | None = None,
 ) -> SceneResult:
     """Анализ одной даты в памяти (без файлов).
 
-    prev_anomalies — (z_ndre, z_ndvi) прошлой даты; prev_means — (средний NDRE, средний NDVI) прошлой даты.
-    Оба нужны только для динамики и необязательны.
+    prev_anomalies — (z_ndre, z_ndvi) прошлой даты; prev_indices — (NDRE, NDVI) прошлой даты на той же сетке.
+    Оба нужны только для динамики и необязательны. Падение средних NDRE/NDVI между датами считается только по
+    пикселям, видимым на обеих датах: иначе облако на одной из дат сдвигает среднее и даёт ложную тревогу.
     """
     zoning_cfg = zoning_cfg or ZoningConfig()
     early_cfg = early_cfg or EarlyStressConfig()
@@ -122,9 +227,24 @@ def analyze_scene(
     n_valid = int(valid.sum())
     idx_stats = {name: index_stats(arr) for name, arr in indices.items()}
     hidden = hidden_stress_stats(early.mask, valid, indices, early.z_ndre, early.z_ndvi, area)
+
+    pair_prev = pair_cur = None
+    common_fraction = None
+    if prev_indices is not None and prev_indices[0].shape == valid.shape:
+        p_ndre, p_ndvi = prev_indices
+        common = (np.isfinite(p_ndre) & np.isfinite(p_ndvi)
+                  & np.isfinite(indices["NDRE"]) & np.isfinite(indices["NDVI"]))
+        common_fraction = round(float(common.sum()) / n_valid, 4) if n_valid else 0.0
+        if common_fraction >= early_cfg.alert_min_overlap:
+            pair_prev = (_mean(p_ndre[common]), _mean(p_ndvi[common]))
+            pair_cur = (_mean(indices["NDRE"][common]), _mean(indices["NDVI"][common]))
     alert = evaluate_alert(
-        hidden["fraction"], idx_stats["NDRE"]["mean"], idx_stats["NDVI"]["mean"], prev_means, early_cfg
+        hidden["fraction"],
+        pair_cur[0] if pair_cur else idx_stats["NDRE"]["mean"],
+        pair_cur[1] if pair_cur else idx_stats["NDVI"]["mean"],
+        pair_prev, early_cfg,
     )
+    alert["common_fraction"] = common_fraction
     record = {
         "date": date,
         "grid": {"width": w, "height": h, "pixel_area_m2": area, "crs_epsg": geo.epsg},
@@ -163,21 +283,85 @@ def build_index_stats_doc(record: dict) -> dict:
         ),
         "field_area_ha": record["field_area_ha"],
     }
-    for k in ("grid", "valid_pixels", "valid_fraction", "indices", "zones", "hidden_stress", "early_stress", "files"):
+    for k in ("grid", "valid_pixels", "valid_fraction", "indices", "zones", "hidden_stress", "early_stress",
+              "input", "files"):
         if k in record:
             doc[k] = record[k]
     return doc
 
 
-def collect_scene_paths(inputs: Sequence[str | Path]) -> list[Path]:
-    paths: list[Path] = []
+def _history_from_outputs(
+    out_dir: Path, date: str, early_cfg: EarlyStressConfig, shape: tuple[int, int]
+) -> tuple[tuple[np.ndarray, np.ndarray], tuple[np.ndarray, np.ndarray], str] | None:
+    """Восстанавливает состояние ближайшей более ранней даты по уже записанным растрам индексов.
+
+    Позволяет обрабатывать серию по одной новой дате (как вызывает main_pipeline): динамика между датами
+    считается так же, как при обработке всей серии за один запуск. Возвращает
+    ((z_ndre, z_ndvi), (NDRE, NDVI), дата) либо None, если подходящей даты нет.
+    """
+    idx_dir = out_dir / "indices"
+    if not idx_dir.is_dir():
+        return None
+    earlier = []
+    for p in idx_dir.glob("NDVI_*.tif"):
+        try:
+            d = parse_date(p.name[len("NDVI_"):])
+        except ValueError:
+            continue
+        if d < date:
+            earlier.append(d)
+    for d in sorted(earlier, reverse=True):
+        stamp = d.replace("-", "_")
+        try:
+            arrs = {n: read_geotiff(idx_dir / f"{n}_{stamp}.tif")[0][0] for n in INDEX_FILE_NAME.values()}
+        except Exception:  # неполный набор файлов или повреждённый файл: пробуем более раннюю дату
+            continue
+        if arrs["NDVI"].shape != tuple(shape):
+            continue
+        valid = np.all([np.isfinite(a) for a in arrs.values()], axis=0)
+        core = core_mask(valid, early_cfg.edge_buffer_px)
+        ndre, ndvi = arrs["NDRE"], arrs["NDVI"]
+        z_re, z_vi = anomalies(np.where(core, ndre, np.nan), np.where(core, ndvi, np.nan), early_cfg)
+        return (z_re, z_vi), (ndre, ndvi), d
+    return None
+
+
+def collect_scenes(inputs: Sequence[str | Path]) -> tuple[list[tuple[Path, str]], list[str]]:
+    """Сцены с датами, по возрастанию даты, и предупреждения.
+
+    В папках берутся *.tif / *.tiff; файлы без даты (ни в имени, ни в теге 'date') и повторы даты пропускаются
+    с предупреждением. Явно переданный файл без даты — ошибка (укажите --date).
+    """
+    found: list[tuple[Path, str]] = []
+    warnings: list[str] = []
     for item in inputs:
         p = Path(item)
         if p.is_dir():
-            paths += sorted(list(p.glob("*.tif")) + list(p.glob("*.tiff")))
+            files = sorted({q for pat in ("*.tif", "*.tiff", "*.TIF", "*.TIFF") for q in p.glob(pat)})
+            for q in files:
+                d = scene_date(q)
+                if d is None:
+                    warnings.append(f"{q.name}: нет даты ни в имени, ни в метаданных — пропущен")
+                else:
+                    found.append((q, d))
         else:
-            paths.append(p)
-    return sorted(paths, key=lambda q: parse_date(q.name))
+            d = scene_date(p)
+            if d is None:
+                raise ValueError(f"{p.name}: нет даты ни в имени, ни в метаданных файла — укажите --date")
+            found.append((p, d))
+    found.sort(key=lambda x: (x[1], x[0].name))
+    unique: list[tuple[Path, str]] = []
+    for p, d in found:
+        if unique and unique[-1][1] == d:
+            warnings.append(f"{p.name}: дата {d} уже есть ({unique[-1][0].name}) — пропущен")
+            continue
+        unique.append((p, d))
+    return unique, warnings
+
+
+def collect_scene_paths(inputs: Sequence[str | Path]) -> list[Path]:
+    """Совместимость: только пути сцен по возрастанию даты."""
+    return [p for p, _ in collect_scenes(inputs)[0]]
 
 
 def _dump_json(path: Path, obj: dict) -> None:
@@ -189,44 +373,58 @@ def _dump_json(path: Path, obj: dict) -> None:
 def run_pipeline(
     inputs: Sequence[str | Path],
     out_dir: str | Path,
-    band_order: Sequence[str] = DEFAULT_BAND_ORDER,
+    band_order: Sequence[str] | None = None,
     scale: float | None = None,
     zoning_cfg: ZoningConfig | None = None,
     early_cfg: EarlyStressConfig | None = None,
     backend: str = "numpy",
     save_indices: bool = True,
     date_override: str | None = None,
+    use_history: bool = False,
 ) -> dict:
     """Обрабатывает все сцены по датам и пишет артефакты в out_dir (раскладка — в docstring модуля).
 
-    date_override — дата YYYY-MM-DD для случая, когда на входе ровно один файл без даты в имени.
+    band_order=None — порядок каналов определяется по каждому файлу (см. resolve_band_order).
+    date_override — дата YYYY-MM-DD для случая, когда на входе ровно одна сцена.
+    use_history — для первой обработанной сцены взять предыдущую дату из уже записанных в out_dir результатов
+    (растры индексов), чтобы считать динамику при поступлении новых снимков по одному.
+    Сводка indices_summary.json дополняется: даты, обработанные ранее, в ней сохраняются.
     """
     out_dir = Path(out_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
     zoning_cfg = zoning_cfg or ZoningConfig()
     early_cfg = early_cfg or EarlyStressConfig()
 
+    warnings: list[str] = []
     if date_override is not None:
-        paths = []
+        paths: list[Path] = []
         for item in inputs:
             p = Path(item)
             paths += (sorted(list(p.glob("*.tif")) + list(p.glob("*.tiff"))) if p.is_dir() else [p])
         if len(paths) != 1:
             raise ValueError("date_override можно использовать только когда на входе ровно одна сцена")
-        date_override = parse_date(date_override)
+        scenes = [(paths[0], parse_date(date_override))]
     else:
-        paths = collect_scene_paths(inputs)
-    if not paths:
-        raise FileNotFoundError("не найдено ни одного GeoTIFF")
+        scenes, warnings = collect_scenes(inputs)
+    for msg in warnings:
+        print(f"предупреждение: {msg}", file=sys.stderr)
+    if not scenes:
+        raise FileNotFoundError("не найдено ни одной сцены GeoTIFF с датой")
 
     dates: dict[str, dict] = {}
     prev_anom: tuple[np.ndarray, np.ndarray] | None = None
-    prev_means: tuple[float | None, float | None] | None = None
-    for path in paths:
-        date = date_override or parse_date(path.name)
+    prev_idx: tuple[np.ndarray, np.ndarray] | None = None
+    prev_date: str | None = None
+    for path, date in scenes:
         try:
-            bands, geo = load_scene(path, band_order, scale)
-            res = analyze_scene(date, bands, geo, zoning_cfg, early_cfg, prev_anom, backend, prev_means)
+            bands, geo, info = read_scene(path, band_order, scale)
+            if use_history and prev_anom is None:
+                hist = _history_from_outputs(out_dir, date, early_cfg, next(iter(bands.values())).shape)
+                if hist is not None:
+                    prev_anom, prev_idx, prev_date = hist
+            res = analyze_scene(date, bands, geo, zoning_cfg, early_cfg, prev_anom, backend, prev_idx)
+            res.record["early_stress"]["compared_with"] = prev_date if prev_anom is not None else None
+            res.record["input"] = info
         except Exception as exc:  # одна плохая сцена не должна ронять весь прогон
             dates[date] = {"date": date, "source_file": path.name, "error": f"{type(exc).__name__}: {exc}"}
             continue
@@ -248,14 +446,15 @@ def run_pipeline(
         _dump_json(out_dir / files["stats"], build_index_stats_doc(res.record))
         dates[date] = res.record
         prev_anom = (res.early.z_ndre, res.early.z_ndvi)
-        prev_means = (res.record["indices"]["NDRE"]["mean"], res.record["indices"]["NDVI"]["mean"])
+        prev_idx = (res.indices["NDRE"], res.indices["NDVI"])
+        prev_date = date
 
     summary = {
         "schema_version": SCHEMA_VERSION,
         "generated_at": datetime.now(timezone.utc).isoformat(timespec="seconds"),
         "config": {
-            "band_order": list(band_order),
-            "scale": scale,
+            "band_order": list(band_order) if band_order else "auto",
+            "scale": scale if scale is not None else "auto",
             "backend": backend,
             "indices": list(INDEX_NAMES),
             "zoning": asdict(zoning_cfg),
@@ -263,17 +462,33 @@ def run_pipeline(
             "zone_raster": "uint8; 0 = нет данных, 1 = худшее состояние (низкий NDRE) ... N = норма",
             "hidden_stress_raster": "uint8; 1 = скрытый стресс, 0 = нет, 255 = нет данных",
         },
+        "warnings": warnings,
         "dates": dates,
     }
-    _dump_json(out_dir / "indices_summary.json", summary)
+    summary_path = out_dir / "indices_summary.json"
+    if summary_path.exists():  # сохраняем даты, обработанные в прошлых запусках
+        try:
+            old = json.loads(summary_path.read_text(encoding="utf-8")).get("dates", {})
+            merged = {d: r for d, r in old.items() if d not in dates and "error" not in r}
+            merged.update(dates)
+            summary["dates"] = dict(sorted(merged.items()))
+        except (OSError, ValueError):
+            pass
+    _dump_json(summary_path, summary)
     return summary
+
+
+def default_out_dir(scene_tif: str | Path) -> Path:
+    """data/scenes/scene_X.tif -> data/ (раскладка из плана); иначе папка m2_output рядом со сценой."""
+    parent = Path(scene_tif).resolve().parent
+    return parent.parent if parent.name == "scenes" else parent / "m2_output"
 
 
 def analyze_field(
     scene_tif: str | Path,
-    out_dir: str | Path,
+    out_dir: str | Path | None = None,
     date: str | None = None,
-    band_order: Sequence[str] = DEFAULT_BAND_ORDER,
+    band_order: Sequence[str] | None = None,
     scale: float | None = None,
     zoning_cfg: ZoningConfig | None = None,
     early_cfg: EarlyStressConfig | None = None,
@@ -281,15 +496,21 @@ def analyze_field(
 ) -> dict:
     """Анализ одной сцены (точка входа по ТЗ КТ2): возвращает запись даты со ссылками на файлы.
 
-    Дата берётся из имени файла (scene_YYYY_MM_DD.tif) либо из параметра date. Динамику между датами
-    даёт только run_pipeline по серии: здесь прошлых дат нет, поэтому флаг early_stress_alert опирается
-    лишь на пространственный признак.
+    out_dir по умолчанию: для data/scenes/scene_YYYY_MM_DD.tif это data/ (результаты в data/zones, data/stats).
+    Дата берётся из date, иначе из имени файла, иначе из тега 'date' в метаданных. Каналы определяются по файлу.
+    Если в out_dir уже есть результаты более ранней даты (растры в out_dir/indices), динамика считается
+    относительно неё, поэтому сцены можно подавать по одной по мере поступления;
+    запись early_stress.compared_with указывает дату сравнения.
     """
+    out_dir = Path(out_dir) if out_dir is not None else default_out_dir(scene_tif)
+    the_date = parse_date(date) if date else scene_date(scene_tif)
+    if the_date is None:
+        raise ValueError(f"{Path(scene_tif).name}: нет даты ни в имени, ни в метаданных — передайте date=")
     summary = run_pipeline(
         [scene_tif], out_dir, band_order=band_order, scale=scale, zoning_cfg=zoning_cfg,
-        early_cfg=early_cfg, backend=backend, date_override=date,
+        early_cfg=early_cfg, backend=backend, date_override=the_date, use_history=True,
     )
-    (record,) = summary["dates"].values()
+    record = summary["dates"][the_date]
     if "error" in record:
         raise RuntimeError(f"{scene_tif}: {record['error']}")
     return record

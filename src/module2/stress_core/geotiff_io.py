@@ -6,7 +6,8 @@ ModelTiepoint, GeoKeyDirectory) и nodata, чтобы маски зон ложи
 """
 from __future__ import annotations
 
-from dataclasses import dataclass
+import xml.etree.ElementTree as ET
+from dataclasses import dataclass, field
 from pathlib import Path
 
 import numpy as np
@@ -18,6 +19,7 @@ TAG_TRANSFORM = 34264
 TAG_GEOKEYS = 34735
 TAG_GEODOUBLE = 34736
 TAG_GEOASCII = 34737
+TAG_GDAL_METADATA = 42112
 TAG_GDAL_NODATA = 42113
 
 # GeoKey IDs
@@ -43,6 +45,9 @@ class GeoMeta:
     geodoubles: tuple | None = None
     geoascii: str | None = None
     nodata: float | None = None
+    # из GDAL_METADATA (только при чтении; в выходные файлы не пишутся)
+    band_names: tuple[str, ...] | None = None  # описания каналов, например ("B02", "B03", ...)
+    tags: dict[str, str] = field(default_factory=dict)  # теги набора данных, например {"date": "2026-08-07"}
 
     # -- конструкторы -------------------------------------------------
     @classmethod
@@ -99,43 +104,83 @@ class GeoMeta:
         return float(abs(self.pixel_scale[0] * self.pixel_scale[1]))
 
 
+def _parse_gdal_metadata(xml_text) -> tuple[tuple[str, ...] | None, dict[str, str]]:
+    """Разбирает тег GDAL_METADATA: описания каналов и теги уровня набора данных."""
+    if not xml_text:
+        return None, {}
+    try:
+        root = ET.fromstring(str(xml_text).strip("\x00 "))
+    except ET.ParseError:
+        return None, {}
+    names: dict[int, str] = {}
+    tags: dict[str, str] = {}
+    for item in root.iter("Item"):
+        name, text = item.get("name"), (item.text or "").strip()
+        if item.get("role") == "description" and item.get("sample") is not None:
+            names[int(item.get("sample"))] = text
+        elif item.get("sample") is None and name:
+            tags[name] = text
+    band_names = tuple(names[i] for i in sorted(names)) if names and sorted(names) == list(range(len(names))) else None
+    return band_names, tags
+
+
+def _meta_from_page(page) -> GeoMeta:
+    tags = page.tags
+
+    def val(code):
+        tag = tags.get(code)
+        return None if tag is None else tag.value
+
+    nodata = val(TAG_GDAL_NODATA)
+    try:
+        nodata = float(str(nodata).strip("\x00 ")) if nodata is not None else None
+    except ValueError:
+        nodata = None
+
+    def tup(code):
+        v = val(code)
+        return None if v is None else tuple(float(x) for x in np.atleast_1d(v))
+
+    geokeys = val(TAG_GEOKEYS)
+    band_names, ds_tags = _parse_gdal_metadata(val(TAG_GDAL_METADATA))
+    return GeoMeta(
+        pixel_scale=tup(TAG_PIXEL_SCALE),
+        tiepoint=tup(TAG_TIEPOINT),
+        model_transformation=tup(TAG_TRANSFORM),
+        geokeys=None if geokeys is None else tuple(int(x) for x in np.atleast_1d(geokeys)),
+        geodoubles=tup(TAG_GEODOUBLE),
+        geoascii=val(TAG_GEOASCII),
+        nodata=nodata,
+        band_names=band_names,
+        tags=ds_tags,
+    )
+
+
+def read_geotiff_meta(path: str | Path) -> GeoMeta:
+    """Только геопривязка и метаданные, без чтения пикселей."""
+    with tifffile.TiffFile(str(path)) as tf:
+        return _meta_from_page(tf.pages[0])
+
+
 def read_geotiff(path: str | Path) -> tuple[np.ndarray, GeoMeta]:
     """Читает GeoTIFF -> (массив [bands, H, W], GeoMeta)."""
     with tifffile.TiffFile(str(path)) as tf:
         page = tf.pages[0]
-        arr = tf.asarray()
-        tags = page.tags
-
-        def val(code):
-            tag = tags.get(code)
-            return None if tag is None else tag.value
-
+        try:
+            arr = tf.asarray()
+        except KeyError as exc:  # tifffile: "<COMPRESSION.LZW> requires the 'imagecodecs' package"
+            if "imagecodecs" in str(exc):
+                raise RuntimeError(
+                    f"{path}: этот способ сжатия TIFF требует пакет imagecodecs ({exc}). "
+                    "Установите: pip install imagecodecs"
+                ) from exc
+            raise
         samples = int(page.samplesperpixel)
         if arr.ndim == 2:
             arr = arr[None]
         elif arr.ndim == 3 and int(page.planarconfig) != 2 and arr.shape[-1] == samples:
             arr = np.moveaxis(arr, -1, 0)  # чересстрочный (chunky) -> [bands, H, W]
-
-        nodata = val(TAG_GDAL_NODATA)
-        try:
-            nodata = float(str(nodata).strip("\x00 ")) if nodata is not None else None
-        except ValueError:
-            nodata = None
-
-        def tup(code):
-            v = val(code)
-            return None if v is None else tuple(float(x) for x in np.atleast_1d(v))
-
-        geokeys = val(TAG_GEOKEYS)
-        meta = GeoMeta(
-            pixel_scale=tup(TAG_PIXEL_SCALE),
-            tiepoint=tup(TAG_TIEPOINT),
-            model_transformation=tup(TAG_TRANSFORM),
-            geokeys=None if geokeys is None else tuple(int(x) for x in np.atleast_1d(geokeys)),
-            geodoubles=tup(TAG_GEODOUBLE),
-            geoascii=val(TAG_GEOASCII),
-            nodata=nodata,
-        )
+        meta = _meta_from_page(page)
     return arr, meta
 
 

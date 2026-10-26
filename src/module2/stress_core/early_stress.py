@@ -42,6 +42,7 @@ class EarlyStressConfig:
     alert_area_fraction: float = 0.01  # скрытый стресс занимает >= 1% валидной площади поля
     alert_min_ndre_drop: float = 0.02  # или: средний NDRE упал на >= 0.02 относительно прошлой даты,
     alert_ratio: float = 1.5  # причём относительное падение NDRE >= 1.5 x падения NDVI
+    alert_min_overlap: float = 0.5  # динамику сравниваем, если общих (без облаков на обеих датах) пикселей >= 50%
 
 
 @dataclass
