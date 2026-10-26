@@ -392,6 +392,264 @@ class EdgePixelsTest(unittest.TestCase):
         self.assertTrue(core_mask(full, 1).all())
 
 
+class IncrementalHistoryTest(unittest.TestCase):
+    """main_pipeline M1 подаёт сцены по одной: результат должен совпадать с обработкой всей серии."""
+
+    @classmethod
+    def setUpClass(cls):
+        cls.tmp = tempfile.TemporaryDirectory()
+        root = Path(cls.tmp.name)
+        cls.inputs = write_demo_scenes(root / "in")
+        cls.batch = root / "batch"
+        cls.inc = root / "inc"
+        cls.cfg = ZoningConfig(n_classes=3)
+        cls.batch_summary = run_pipeline(cls.inputs, cls.batch, zoning_cfg=cls.cfg)
+        cls.records = [analyze_field(p, cls.inc, zoning_cfg=cls.cfg) for p in cls.inputs]
+
+    @classmethod
+    def tearDownClass(cls):
+        cls.tmp.cleanup()
+
+    def test_same_masks_as_batch(self):
+        for stamp in ("2026_06_05", "2026_06_20", "2026_07_05"):
+            for sub, name in (("zones", "zones"), ("hidden_stress", "hidden_stress")):
+                a, _ = read_geotiff(self.batch / sub / f"{name}_{stamp}.tif")
+                b, _ = read_geotiff(self.inc / sub / f"{name}_{stamp}.tif")
+                np.testing.assert_array_equal(a, b, f"{name}_{stamp}")
+
+    def test_same_stats_and_alert_as_batch(self):
+        for stamp in ("2026_06_05", "2026_06_20", "2026_07_05"):
+            a = json.loads((self.batch / "stats" / f"index_stats_{stamp}.json").read_text(encoding="utf-8"))
+            b = json.loads((self.inc / "stats" / f"index_stats_{stamp}.json").read_text(encoding="utf-8"))
+            for key in ("mean_ndvi", "mean_ndre", "mean_msavi", "mean_ndmi", "early_stress_alert",
+                        "early_stress_area_ha", "early_stress_percent"):
+                self.assertEqual(a[key], b[key], f"{stamp} {key}")
+            self.assertEqual(a["early_stress"], b["early_stress"], stamp)
+
+    def test_compared_with_points_to_previous_date(self):
+        self.assertEqual([r["early_stress"]["compared_with"] for r in self.records],
+                         [None, "2026-06-05", "2026-06-20"])
+
+    def test_summary_keeps_all_dates(self):
+        data = json.loads((self.inc / "indices_summary.json").read_text(encoding="utf-8"))
+        self.assertEqual(list(data["dates"]), ["2026-06-05", "2026-06-20", "2026-07-05"])
+
+    def test_reprocessing_a_date_does_not_change_other_dates_and_uses_only_earlier_ones(self):
+        rec = analyze_field(self.inputs[1], self.inc, zoning_cfg=self.cfg)  # вторая дата повторно
+        self.assertEqual(rec["early_stress"]["compared_with"], "2026-06-05")
+        data = json.loads((self.inc / "indices_summary.json").read_text(encoding="utf-8"))
+        self.assertEqual(len(data["dates"]), 3)
+
+    def test_history_with_different_grid_is_ignored(self):
+        with tempfile.TemporaryDirectory() as d:
+            d = Path(d)
+            small = d / "scene_2026_05_01.tif"
+            rng = np.random.default_rng(5)
+            stack = (np.array([400, 1400, 4500, 2000])[:, None, None]
+                     * (1 + 0.03 * rng.standard_normal((4, 40, 40)))).astype(np.uint16)
+            write_geotiff(small, stack, GeoMeta.from_origin(0, 0, 10, 10, 32637), nodata=0)
+            analyze_field(small, d / "out", zoning_cfg=ZoningConfig(n_classes=3, min_zone_px=1))
+            rec = analyze_field(self.inputs[0], d / "out", zoning_cfg=self.cfg)  # другая сетка 120x160
+            self.assertIsNone(rec["early_stress"]["compared_with"])
+
+
+def _write_gdal_scene(path, stack, descriptions=None, date=None, geo=None, nodata=0):
+    """GeoTIFF как у rasterio в build_sample.py M1: описания каналов и тег date в GDAL_METADATA."""
+    import tifffile
+    from stress_core.geotiff_io import GeoMeta as _GM
+    geo = geo or _GM.from_origin(597_610, 5_249_140, 10, 10, 32637)
+    items = []
+    if date:
+        items.append(f'<Item name="date">{date}</Item>')
+    for i, d in enumerate(descriptions or []):
+        items.append(f'<Item name="DESCRIPTION" sample="{i}" role="description">{d}</Item>')
+    write_geotiff(path, stack, geo, nodata=nodata)
+    if items:  # дописываем GDAL_METADATA, сохранив данные и геотеги
+        arr = tifffile.imread(path)
+        with tifffile.TiffFile(path) as tf:
+            extra = [(t.code, t.dtype, t.count, t.value, True) for t in tf.pages[0].tags
+                     if t.code in (33550, 33922, 34735, 34736, 34737, 42113)]
+        xml = "<GDALMetadata>" + "".join(items) + "</GDALMetadata>"
+        tifffile.imwrite(path, arr, photometric="minisblack", planarconfig="separate",
+                         extratags=extra + [(42112, "s", 0, xml, True)], metadata=None)
+
+
+def _s2_stack(h=50, w=50, seed=0, dtype=np.uint16, scale=10_000):
+    """10 каналов в порядке M1, круглое поле, вне поля 0."""
+    rng = np.random.default_rng(seed)
+    yy, xx = np.mgrid[:h, :w]
+    field = (yy - h / 2) ** 2 + (xx - w / 2) ** 2 < (min(h, w) / 2 - 3) ** 2
+    base = [.03, .05, .035, .07, .20, .25, .45, .46, .14, .07]  # B,G,R,RE1,RE2,RE3,N,N2,S1,S2
+    bands = [np.where(field, v * (1 + 0.03 * rng.standard_normal((h, w))) * scale, 0) for v in base]
+    return np.stack(bands).astype(dtype), field
+
+
+class BandOrderAndMetadataTest(unittest.TestCase):
+    """Каналы и дата берутся из файла; перепутанные каналы не проходят молча."""
+
+    def test_resolve_band_order_rules(self):
+        from stress_core.pipeline import SENTINEL2_10_BAND_ORDER as S2, resolve_band_order as rb
+        desc = ("B02", "B03", "B04", "B05", "B06", "B07", "B08", "B8A", "B11", "B12")
+        self.assertEqual(rb(10, None, desc), S2)
+        self.assertEqual(rb(10, None, None), S2)
+        self.assertEqual(rb(4, None, None), ("R", "RE1", "N", "S1"))
+        self.assertEqual(rb(4, None, ("B4", "B05_20m", "b08", "B11")), ("R", "RE1", "N", "S1"))
+        self.assertEqual(rb(10, S2, desc), S2)
+        with self.assertRaises(ValueError):
+            rb(10, ("R", "RE1", "N", "S1"), None)  # 4 имени на 10 каналов: раньше молча брались первые 4
+        with self.assertRaises(ValueError):
+            rb(4, ("N", "R", "RE1", "S1"), ("B04", "B05", "B08", "B11"))  # противоречит описаниям
+        with self.assertRaises(ValueError):
+            rb(7, None, None)
+
+    def test_sample_like_scene_needs_no_bands_or_date(self):
+        stack, field = _s2_stack()
+        desc = ["B02", "B03", "B04", "B05", "B06", "B07", "B08", "B8A", "B11", "B12"]
+        with tempfile.TemporaryDirectory() as d:
+            d = Path(d)
+            _write_gdal_scene(d / "sample_scene.tif", stack, desc, "2026-08-07")
+            s = run_pipeline([d / "sample_scene.tif"], d / "out", zoning_cfg=ZoningConfig(n_classes=3))
+            rec = s["dates"]["2026-08-07"]
+            self.assertNotIn("error", rec)
+            self.assertEqual(rec["input"]["band_order"], ["B", "G", "R", "RE1", "RE2", "RE3", "N", "N2", "S1", "S2"])
+            self.assertEqual(rec["input"]["scale"], 10_000.0)
+            zones, _ = read_geotiff(d / "out" / "zones" / "zones_2026_08_07.tif")
+            np.testing.assert_array_equal(zones[0] > 0, field)
+            self.assertAlmostEqual(rec["indices"]["NDVI"]["mean"], (.45 - .035) / (.45 + .035), places=2)
+
+    def test_shuffled_bands_are_mapped_by_description(self):
+        stack, _ = _s2_stack()
+        desc = ["B02", "B03", "B04", "B05", "B06", "B07", "B08", "B8A", "B11", "B12"]
+        perm = [6, 2, 9, 3, 0, 8, 1, 7, 5, 4]
+        with tempfile.TemporaryDirectory() as d:
+            d = Path(d)
+            _write_gdal_scene(d / "scene_2026_08_07.tif", stack, desc)
+            _write_gdal_scene(d / "shuf_2026_08_07.tif", stack[perm], [desc[i] for i in perm])
+            a = analyze_field(d / "scene_2026_08_07.tif", d / "a", zoning_cfg=ZoningConfig(n_classes=3))
+            b = analyze_field(d / "shuf_2026_08_07.tif", d / "b", zoning_cfg=ZoningConfig(n_classes=3))
+            for n in ("NDVI", "NDRE", "MSAVI2", "NDMI"):
+                self.assertEqual(a["indices"][n]["mean"], b["indices"][n]["mean"], n)
+
+    def test_wrong_explicit_order_is_an_error_not_garbage(self):
+        stack, _ = _s2_stack()
+        with tempfile.TemporaryDirectory() as d:
+            d = Path(d)
+            _write_gdal_scene(d / "scene_2026_08_07.tif", stack)  # без описаний
+            s = run_pipeline([d / "scene_2026_08_07.tif"], d / "out", band_order=("R", "RE1", "N", "S1"))
+            self.assertIn("error", s["dates"]["2026-08-07"])
+            self.assertIn("s2-10", s["dates"]["2026-08-07"]["error"])
+
+    def test_float_scenes_both_normalised_and_dn(self):
+        u16, _ = _s2_stack()
+        refl = np.where(u16 > 0, u16 / 10_000.0, 0).astype(np.float32)  # как в плане M1: float32 / 10000
+        dn = u16.astype(np.float32)  # float, но без нормировки
+        with tempfile.TemporaryDirectory() as d:
+            d = Path(d)
+            res = {}
+            for name, st in (("u16", u16), ("refl", refl), ("dn", dn)):
+                _write_gdal_scene(d / f"{name}_2026_08_07.tif", st)
+                res[name] = analyze_field(d / f"{name}_2026_08_07.tif", d / name, zoning_cfg=ZoningConfig(n_classes=3))
+            self.assertEqual(res["refl"]["input"]["scale"], 1.0)
+            self.assertEqual(res["dn"]["input"]["scale"], 10_000.0)
+            for n in ("NDVI", "NDRE", "MSAVI2", "NDMI"):
+                self.assertAlmostEqual(res["refl"]["indices"][n]["mean"], res["u16"]["indices"][n]["mean"], places=4)
+                self.assertAlmostEqual(res["dn"]["indices"][n]["mean"], res["u16"]["indices"][n]["mean"], places=4)
+
+    def test_missing_codec_gives_clear_message(self):
+        from unittest import mock
+        import tifffile
+        with tempfile.TemporaryDirectory() as d:
+            p = Path(d) / "x.tif"
+            write_geotiff(p, np.ones((5, 5), np.uint8))
+            err = KeyError("<COMPRESSION.LZW: 5> requires the 'imagecodecs' package")
+            with mock.patch.object(tifffile.TiffFile, "asarray", side_effect=err):
+                with self.assertRaises(RuntimeError) as cm:
+                    read_geotiff(p)
+            self.assertIn("pip install imagecodecs", str(cm.exception))
+
+
+class SceneCollectionTest(unittest.TestCase):
+    def test_undated_files_and_duplicates_are_skipped_with_warning(self):
+        from stress_core.pipeline import collect_scenes
+        with tempfile.TemporaryDirectory() as d:
+            d = Path(d)
+            src = write_demo_scenes(d / "scenes")
+            (d / "scenes" / "notes.tif").write_bytes(src[0].read_bytes())  # без даты
+            (d / "scenes" / "copy_2026-06-05.tif").write_bytes(src[0].read_bytes())  # повтор даты
+            scenes, warns = collect_scenes([d / "scenes"])
+            self.assertEqual([dt for _, dt in scenes], ["2026-06-05", "2026-06-20", "2026-07-05"])
+            self.assertEqual(len(warns), 2)
+            s = run_pipeline([d / "scenes"], d / "out", zoning_cfg=ZoningConfig(n_classes=3))
+            self.assertEqual(len(s["warnings"]), 2)
+            self.assertEqual(len(s["dates"]), 3)
+
+    def test_explicit_undated_file_is_an_error(self):
+        from stress_core.pipeline import collect_scenes
+        with tempfile.TemporaryDirectory() as d:
+            p = write_demo_scenes(Path(d))[0]
+            q = Path(d) / "noname.tif"
+            q.write_bytes(p.read_bytes())
+            with self.assertRaises(ValueError):
+                collect_scenes([q])
+
+    def test_analyze_field_default_out_dir_is_data(self):
+        with tempfile.TemporaryDirectory() as d:
+            data = Path(d) / "data"
+            scene = write_demo_scenes(data / "scenes")[0]
+            rec = analyze_field(scene, zoning_cfg=ZoningConfig(n_classes=3))  # как в ТЗ: analyze_field(scene_tif)
+            self.assertTrue((data / "zones" / "zones_2026_06_05.tif").exists())
+            self.assertTrue((data / "stats" / "index_stats_2026_06_05.json").exists())
+            self.assertEqual(rec["date"], "2026-06-05")
+
+
+class CloudAwareDynamicsTest(unittest.TestCase):
+    """Облако на одной из дат не должно давать ложную тревогу «NDRE падает быстрее NDVI»."""
+
+    @staticmethod
+    def _bands(cloud_left=False, seed=0):
+        rng = np.random.default_rng(seed)
+        h, w = 60, 60
+        n = 0.45 * (1 + 0.01 * rng.standard_normal((h, w)))
+        left = np.zeros((h, w), bool)
+        left[:, : w // 2] = True
+        ndvi_t = np.where(left, 0.85, 0.80)
+        ndre_t = np.where(left, 0.60, 0.45)
+        r = n * (1 - ndvi_t) / (1 + ndvi_t)
+        re1 = n * (1 - ndre_t) / (1 + ndre_t)
+        bands = {"R": r, "RE1": re1, "N": n, "S1": np.full((h, w), 0.2)}
+        if cloud_left:
+            bands = {k: np.where(left, np.nan, v) for k, v in bands.items()}
+        return bands
+
+    def test_no_false_dynamic_alert_when_cloud_hides_healthy_part(self):
+        geo = GeoMeta.from_origin(0, 0, 10, 10, 32637)
+        cfg = ZoningConfig(n_classes=3)
+        r1 = analyze_scene("2026-06-05", self._bands(), geo, cfg)
+        r2 = analyze_scene("2026-06-12", self._bands(cloud_left=True, seed=1), geo, cfg,
+                           prev_anomalies=(r1.early.z_ndre, r1.early.z_ndvi),
+                           prev_indices=(r1.indices["NDRE"], r1.indices["NDVI"]))
+        # по средним всего поля облако имитирует падение NDRE (так считала прежняя версия)
+        naive = evaluate_alert(0.0, r2.record["indices"]["NDRE"]["mean"], r2.record["indices"]["NDVI"]["mean"],
+                               (r1.record["indices"]["NDRE"]["mean"], r1.record["indices"]["NDVI"]["mean"]))
+        self.assertIn("ndre_faster_than_ndvi", naive["reasons"])
+        es = r2.record["early_stress"]
+        self.assertNotIn("ndre_faster_than_ndvi", es["reasons"])
+        self.assertEqual(es["common_fraction"], 1.0)
+        self.assertLess(abs(es["ndre_drop"]), 0.005)
+
+    def test_real_decline_on_common_pixels_still_alerts(self):
+        geo = GeoMeta.from_origin(0, 0, 10, 10, 32637)
+        cfg = ZoningConfig(n_classes=3)
+        b1 = self._bands()
+        b2 = self._bands(seed=1)
+        n = b2["N"]
+        ndre_t = np.where(np.arange(60)[None, :] < 30, 0.54, 0.40)  # NDRE падает на всём поле
+        b2["RE1"] = n * (1 - ndre_t) / (1 + ndre_t)
+        r1 = analyze_scene("2026-06-05", b1, geo, cfg)
+        r2 = analyze_scene("2026-06-12", b2, geo, cfg, prev_indices=(r1.indices["NDRE"], r1.indices["NDVI"]))
+        self.assertIn("ndre_faster_than_ndvi", r2.record["early_stress"]["reasons"])
+
+
 class AlertRuleTest(unittest.TestCase):
     def test_area_rule(self):
         self.assertTrue(evaluate_alert(0.05, 0.5, 0.8, None)["alert"])

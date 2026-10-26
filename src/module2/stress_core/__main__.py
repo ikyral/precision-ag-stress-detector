@@ -12,9 +12,7 @@ from pathlib import Path
 
 from .early_stress import EarlyStressConfig
 from .indices import INDEX_NAMES, compute_indices
-from .pipeline import (
-    DEFAULT_BAND_ORDER, SENTINEL2_10_BAND_ORDER, load_scene, run_pipeline, save_index_rasters,
-)
+from .pipeline import SENTINEL2_10_BAND_ORDER, load_scene, run_pipeline, save_index_rasters
 from .synthetic import write_demo_scenes
 from .zoning import ZoningConfig
 
@@ -23,7 +21,9 @@ def _classes(value: str) -> int | None:
     return None if value.lower() == "auto" else int(value)
 
 
-def _bands(value: str) -> tuple[str, ...]:
+def _bands(value: str) -> tuple[str, ...] | None:
+    if value.lower() == "auto":
+        return None
     if value.lower() in ("s2-10", "s2_10"):  # B,G,R,RE1,RE2,RE3,N,N2,S1,S2 — формат sample_scene.tif
         return SENTINEL2_10_BAND_ORDER
     return tuple(b.strip() for b in value.split(",") if b.strip())
@@ -31,11 +31,13 @@ def _bands(value: str) -> tuple[str, ...]:
 
 def _add_common(p: argparse.ArgumentParser) -> None:
     p.add_argument("-o", "--out", required=True, type=Path, help="папка результатов")
-    p.add_argument("--bands", type=_bands, default=DEFAULT_BAND_ORDER,
-                   help="порядок каналов в файле, имена из ASI через запятую (по умолчанию R,RE1,N,S1); "
-                        "'s2-10' = B,G,R,RE1,RE2,RE3,N,N2,S1,S2 как в sample_scene.tif")
+    p.add_argument("--bands", type=_bands, default=None,
+                   help="порядок каналов: по умолчанию определяется по файлу (описания B02..B12; 10 каналов = "
+                        "формат M1; 4 канала = R,RE1,N,S1). Иначе имена ASI через запятую или "
+                        "'s2-10' = B,G,R,RE1,RE2,RE3,N,N2,S1,S2")
     p.add_argument("--scale", type=float, default=None,
-                   help="делитель DN (по умолчанию 10000 для int, 1 для float)")
+                   help="делитель DN -> отражение (по умолчанию 10000 для целых; для float 1, "
+                        "если значения уже 0..1, иначе 10000)")
     p.add_argument("--backend", choices=["numpy", "spyndex"], default="numpy")
 
 
@@ -46,10 +48,13 @@ def main(argv=None) -> int:
 
     run = sub.add_parser("run", help="обработать GeoTIFF-сцены")
     run.add_argument("inputs", nargs="+", help="файлы или папки с GeoTIFF (дата YYYY_MM_DD в имени)")
-    run.add_argument("--date", help="дата YYYY-MM-DD, если на входе одна сцена без даты в имени")
+    run.add_argument("--date", help="дата YYYY-MM-DD для одной сцены (по умолчанию из имени файла "
+                                    "или тега 'date' в метаданных)")
     run.add_argument("--classes", type=_classes, default=3,
                      help="число классов 2–5 или 'auto' (по умолчанию 3 — контракт M2 -> M3)")
     run.add_argument("--no-indices", action="store_true", help="не сохранять растры индексов")
+    run.add_argument("--no-history", action="store_true",
+                     help="не сравнивать первую сцену с более ранней датой из уже имеющихся результатов в -o")
     _add_common(run)
 
     idx = sub.add_parser("indices", help="посчитать индексы одной сцены и сохранить NDVI.tif, NDRE.tif, ...")
@@ -70,13 +75,13 @@ def main(argv=None) -> int:
 
     zcfg = ZoningConfig(n_classes=args.classes)
     if args.cmd == "run":
-        inputs, date, save_idx = args.inputs, args.date, not args.no_indices
+        inputs, date, save_idx, history = args.inputs, args.date, not args.no_indices, not args.no_history
     else:
-        inputs, date, save_idx = [str(p) for p in write_demo_scenes(args.out / "demo_input")], None, True
+        inputs, date, save_idx, history = [str(p) for p in write_demo_scenes(args.out / "demo_input")], None, True, False
 
     summary = run_pipeline(inputs, args.out, band_order=args.bands, scale=args.scale,
                            zoning_cfg=zcfg, early_cfg=EarlyStressConfig(), backend=args.backend,
-                           save_indices=save_idx, date_override=date)
+                           save_indices=save_idx, date_override=date, use_history=history)
     ok = [d for d, r in summary["dates"].items() if "error" not in r]
     bad = {d: r["error"] for d, r in summary["dates"].items() if "error" in r}
     print(f"обработано дат: {len(ok)}; результаты: {args.out}")
