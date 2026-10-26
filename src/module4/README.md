@@ -37,7 +37,3 @@ streamlit run app.py
 Экономика пересчитывается под слайдеры: норма зоны = базовая норма × `rate_factor`
 (если `rate_factor` нет в `metrics_*.json`, он считается как норма зоны / `base_rate_kg_ha`;
 если нет и этого — 100% / 53% / 0% для зон 1 / 2 / 3).
-
-## Вопросы к команде
-- **M3:** в какую папку пишутся `prescription_*.geojson`, `shapefile_*.zip`, `metrics_*.json`? Дашборд ищет в `data/vra/`, `data/prescriptions/` и `data/`. Просьба добавить в `metrics_*.json` поля `base_rate_kg_ha`, `price_per_kg` и `zone_breakdown[].rate_factor`.
-- **M2:** в каких единицах `early_stress.ndre_drop / ndvi_drop`? Сейчас дашборд их не показывает, выводит только `reasons` и площадь скрытого стресса.
