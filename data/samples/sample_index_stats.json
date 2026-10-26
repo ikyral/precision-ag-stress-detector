@@ -1,0 +1,146 @@
+{
+  "schema_version": "1.1",
+  "date": "2026-08-07",
+  "source_file": "sample_scene.tif",
+  "mean_ndvi": 0.774987,
+  "mean_ndre": 0.56045,
+  "mean_msavi": 0.497682,
+  "mean_ndmi": 0.294544,
+  "early_stress_alert": false,
+  "early_stress_area_ha": 0.0,
+  "early_stress_percent": 0.0,
+  "field_area_ha": 79.6,
+  "grid": {
+    "width": 104,
+    "height": 104,
+    "pixel_area_m2": 100.0,
+    "crs_epsg": 32637
+  },
+  "valid_pixels": 7960,
+  "valid_fraction": 0.735947,
+  "indices": {
+    "NDVI": {
+      "n": 7960,
+      "mean": 0.774987,
+      "std": 0.060108,
+      "min": 0.265033,
+      "max": 0.860313,
+      "p5": 0.67615,
+      "p25": 0.756755,
+      "p50": 0.783413,
+      "p75": 0.812132,
+      "p95": 0.839863
+    },
+    "NDRE": {
+      "n": 7960,
+      "mean": 0.56045,
+      "std": 0.061962,
+      "min": 0.183079,
+      "max": 0.690564,
+      "p5": 0.452502,
+      "p25": 0.53252,
+      "p50": 0.568189,
+      "p75": 0.601558,
+      "p95": 0.639268
+    },
+    "MSAVI2": {
+      "n": 7960,
+      "mean": 0.497682,
+      "std": 0.074202,
+      "min": 0.100554,
+      "max": 0.663954,
+      "p5": 0.36085,
+      "p25": 0.46054,
+      "p50": 0.502115,
+      "p75": 0.548253,
+      "p95": 0.603482
+    },
+    "NDMI": {
+      "n": 7960,
+      "mean": 0.294544,
+      "std": 0.068478,
+      "min": -0.1086,
+      "max": 0.424288,
+      "p5": 0.161871,
+      "p25": 0.267812,
+      "p50": 0.301018,
+      "p75": 0.341831,
+      "p95": 0.377239
+    }
+  },
+  "zones": {
+    "n_classes": 3,
+    "silhouette": null,
+    "classes": [
+      {
+        "class": 1,
+        "label": "сильный стресс",
+        "pixels": 310,
+        "fraction": 0.038945,
+        "area_ha": 3.1,
+        "mean": {
+          "NDVI": 0.637311,
+          "NDRE": 0.421112,
+          "MSAVI2": 0.339176,
+          "NDMI": 0.156268
+        }
+      },
+      {
+        "class": 2,
+        "label": "умеренный стресс",
+        "pixels": 4235,
+        "fraction": 0.532035,
+        "area_ha": 42.35,
+        "mean": {
+          "NDVI": 0.754859,
+          "NDRE": 0.538415,
+          "MSAVI2": 0.465199,
+          "NDMI": 0.267914
+        }
+      },
+      {
+        "class": 3,
+        "label": "норма",
+        "pixels": 3415,
+        "fraction": 0.42902,
+        "area_ha": 34.15,
+        "mean": {
+          "NDVI": 0.812446,
+          "NDRE": 0.600424,
+          "MSAVI2": 0.552354,
+          "NDMI": 0.340121
+        }
+      }
+    ]
+  },
+  "hidden_stress": {
+    "pixels": 0,
+    "fraction": 0.0,
+    "area_ha": 0.0,
+    "mean": {
+      "NDVI": null,
+      "NDRE": null,
+      "MSAVI2": null,
+      "NDMI": null
+    },
+    "mean_z_ndre": null,
+    "mean_z_ndvi": null
+  },
+  "early_stress": {
+    "alert": false,
+    "reasons": [],
+    "ndre_drop": null,
+    "ndvi_drop": null
+  },
+  "files": {
+    "zones": "zones/zones_2026_08_07.tif",
+    "hidden_stress": "hidden_stress/hidden_stress_2026_08_07.tif",
+    "stats": "stats/index_stats_2026_08_07.json",
+    "indices": {
+      "NDVI": "indices/NDVI_2026_08_07.tif",
+      "NDRE": "indices/NDRE_2026_08_07.tif",
+      "MSAVI": "indices/MSAVI_2026_08_07.tif",
+      "NDMI": "indices/NDMI_2026_08_07.tif"
+    }
+  }
+}
