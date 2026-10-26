@@ -1,0 +1,17 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "precision-ag-vra"
+version = "1.0.0"
+description = "Module 3: VRA prescriptions and application economics"
+requires-python = ">=3.11"
+dependencies = ["numpy>=1.26,<3", "rasterio>=1.3.10,<2", "geopandas>=1.0,<2", "shapely>=2.0,<3", "pyproj>=3.6,<4", "pyogrio>=0.9,<1"]
+
+[project.scripts]
+vra = "vra.__main__:main"
+
+[tool.setuptools.packages.find]
+where = ["."]
+include = ["vra*"]
