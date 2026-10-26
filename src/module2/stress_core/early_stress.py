@@ -37,6 +37,7 @@ class EarlyStressConfig:
     dz_ndvi_max_drop: float = 0.5  # при этом NDVI-аномалия падает меньше, чем на это
     temporal_z_ndre_floor: float = 0.5  # и NDRE-аномалия уже <= -floor
     min_area_px: int = 12
+    edge_buffer_px: int = 1  # краевые смешанные пиксели не считаются очагом
     # флаг early_stress_alert (для дашборда M4)
     alert_area_fraction: float = 0.01  # скрытый стресс занимает >= 1% валидной площади поля
     alert_min_ndre_drop: float = 0.02  # или: средний NDRE упал на >= 0.02 относительно прошлой даты,

@@ -69,3 +69,17 @@ def remove_small_objects(mask: np.ndarray, min_size: int) -> np.ndarray:
     sizes = ndi.sum(mask, labels, index=np.arange(1, n + 1))
     keep = np.concatenate([[False], sizes >= min_size])
     return keep[labels]
+
+
+def core_mask(valid: np.ndarray, buffer_px: int) -> np.ndarray:
+    """Валидные пиксели без краевого пояса шириной buffer_px (8-связность).
+
+    Пиксели на границе поля или у дыры от облака смешанные: часть площади пикселя занимает соседний
+    объект (дорога, другое поле, тень), поэтому их спектр искажён. Край самого растра краем поля не считается.
+    """
+    valid = np.asarray(valid, dtype=bool)
+    if buffer_px <= 0:
+        return valid.copy()
+    return ndi.binary_erosion(
+        valid, structure=ndi.generate_binary_structure(2, 2), iterations=int(buffer_px), border_value=1
+    )

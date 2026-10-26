@@ -342,6 +342,56 @@ class PipelineTest(unittest.TestCase):
         self.assertEqual(len(good), 3)
 
 
+class EdgePixelsTest(unittest.TestCase):
+    """Смешанные пиксели на границе поля не должны становиться «стрессом»; контур не меняется."""
+
+    @staticmethod
+    def _disc_scene(seed=0, n=90, r=38):
+        rng = np.random.default_rng(seed)
+        yy, xx = np.mgrid[:n, :n]
+        dist = np.sqrt((yy - n / 2) ** 2 + (xx - n / 2) ** 2)
+        field = dist < r
+        ring = field & ~ndi.binary_erosion(field, structure=ndi.generate_binary_structure(2, 2))
+        healthy = {"R": .04, "RE1": .14, "N": .45, "S1": .20}
+        bands = {}
+        for b, v in healthy.items():
+            arr = v * (1 + 0.02 * rng.standard_normal((n, n)))
+            bands[b] = np.where(field, arr, np.nan)
+        for b, shift in {"R": .05, "RE1": .06, "N": -.18, "S1": .07}.items():  # смесь с дорогой: плохой спектр
+            bands[b] = np.where(ring, bands[b] + shift, bands[b])
+        return bands, field, ring
+
+    def test_edge_ring_not_stress_and_footprint_unchanged(self):
+        bands, field, ring = self._disc_scene()
+        geo = GeoMeta.from_origin(0, 0, 10, 10, 32637)
+        with_buf = analyze_scene("2026-08-07", bands, geo, ZoningConfig(n_classes=3))
+        no_buf = analyze_scene("2026-08-07", bands, geo, ZoningConfig(n_classes=3, edge_buffer_px=0))
+        z, z0 = with_buf.zoning.zones, no_buf.zoning.zones
+        inner = ndi.binary_erosion(field, iterations=4)  # поле однородное, класс 1 из шума есть и внутри
+        enrich0 = (z0[ring] == 1).mean() - (z0[inner] == 1).mean()
+        enrich = (z[ring] == 1).mean() - (z[inner] == 1).mean()
+        self.assertGreater(enrich0, 0.15)  # без защиты кайма обогащена «стрессом» (образует свой кластер)
+        self.assertLess(enrich, 0.10)  # с защитой кайма не отличается от внутренности поля
+        np.testing.assert_array_equal(z > 0, field)  # контур и площадь поля те же
+        np.testing.assert_array_equal(z0 > 0, field)
+
+    def test_hidden_stress_ignores_edge_ring(self):
+        bands, field, ring = self._disc_scene()
+        geo = GeoMeta.from_origin(0, 0, 10, 10, 32637)
+        res = analyze_scene("2026-08-07", bands, geo, ZoningConfig(n_classes=3))
+        self.assertFalse(res.early.mask[ring].any())
+
+    def test_core_mask(self):
+        from stress_core.filters import core_mask
+        valid = np.zeros((7, 7), bool)
+        valid[1:6, 1:6] = True
+        core = core_mask(valid, 1)
+        self.assertEqual(int(core.sum()), 9)  # 5x5 -> 3x3
+        np.testing.assert_array_equal(core_mask(valid, 0), valid)
+        full = np.ones((5, 5), bool)  # край самого растра краем поля не считается
+        self.assertTrue(core_mask(full, 1).all())
+
+
 class AlertRuleTest(unittest.TestCase):
     def test_area_rule(self):
         self.assertTrue(evaluate_alert(0.05, 0.5, 0.8, None)["alert"])

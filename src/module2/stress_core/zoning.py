@@ -22,7 +22,7 @@ from scipy import ndimage as ndi
 from sklearn.cluster import KMeans
 from sklearn.metrics import silhouette_score
 
-from .filters import smooth_nan, zscore
+from .filters import core_mask, smooth_nan, zscore
 
 CLASS_LABELS: dict[int, list[str]] = {
     1: ["однородное поле"],
@@ -53,6 +53,7 @@ class ZoningConfig:
     max_fit_samples: int = 50_000
     silhouette_samples: int = 4_000
     random_state: int = 0
+    edge_buffer_px: int = 1  # краевой пояс (смешанные пиксели) не участвует в кластеризации, класс берёт у соседей
     order_by: str = "NDRE"  # класс 1 — худший по этому признаку (ТЗ: сортировка по среднему NDRE)
 
 
@@ -124,12 +125,27 @@ def _merge_small(cls: np.ndarray, min_px: int, max_rounds: int = 5) -> np.ndarra
     return out
 
 
+def _fill_edge(cls: np.ndarray, full_valid: np.ndarray) -> np.ndarray:
+    """Валидные пиксели без класса (краевой пояс) получают класс ближайшего классифицированного пикселя."""
+    gap = full_valid & (cls == 0)
+    if not gap.any() or not (cls > 0).any():
+        return cls
+    _, (iy, ix) = ndi.distance_transform_edt(cls == 0, return_indices=True)
+    out = cls.copy()
+    out[gap] = cls[iy, ix][gap]
+    return out
+
+
 def segment_zones(
     indices: dict[str, np.ndarray], cfg: ZoningConfig | None = None
 ) -> ZoningResult:
     """Строит растр зон управления по набору индексов (2D float, NaN = нет данных)."""
     cfg = cfg or ZoningConfig()
-    smoothed = [smooth_nan(indices[name], cfg.feature_sigma_px) for name in cfg.features]
+    full_valid = np.all([np.isfinite(indices[name]) for name in cfg.features], axis=0)
+    core = core_mask(full_valid, cfg.edge_buffer_px)  # без краевого пояса из смешанных пикселей
+    smoothed = [
+        smooth_nan(np.where(core, indices[name], np.nan), cfg.feature_sigma_px) for name in cfg.features
+    ]
     valid = np.all([np.isfinite(s) for s in smoothed], axis=0)
     n_valid = int(valid.sum())
     k_floor = cfg.n_classes if cfg.n_classes else cfg.k_max
@@ -167,6 +183,7 @@ def segment_zones(
         for _ in range(cfg.majority_iters):
             cls = _majority(cls, k, cfg.majority_size)
     cls = _merge_small(cls, cfg.min_zone_px)
+    cls = _fill_edge(cls, full_valid)  # краевой пояс получает класс ближайшей зоны: контур поля не меняется
 
     # нумерация подряд 1..N (классы могли исчезнуть при сглаживании)
     present = np.unique(cls[cls > 0])
@@ -177,7 +194,7 @@ def segment_zones(
     # после сглаживания порядок мог чуть сдвинуться: финально сортируем классы по среднему order_by
     composite = z[order_idx] if order_idx is not None else z.mean(axis=0)
     n_final = len(present)
-    means = np.array([float(np.mean(composite[cls == i])) for i in range(1, n_final + 1)])
+    means = np.array([float(np.nanmean(composite[cls == i])) for i in range(1, n_final + 1)])
     if np.any(np.diff(means) < 0):
         new_rank = np.empty(n_final + 1, dtype=np.uint8)
         new_rank[0] = 0
