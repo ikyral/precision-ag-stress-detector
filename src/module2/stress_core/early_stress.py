@@ -37,6 +37,10 @@ class EarlyStressConfig:
     dz_ndvi_max_drop: float = 0.5  # при этом NDVI-аномалия падает меньше, чем на это
     temporal_z_ndre_floor: float = 0.5  # и NDRE-аномалия уже <= -floor
     min_area_px: int = 12
+    # флаг early_stress_alert (для дашборда M4)
+    alert_area_fraction: float = 0.01  # скрытый стресс занимает >= 1% валидной площади поля
+    alert_min_ndre_drop: float = 0.02  # или: средний NDRE упал на >= 0.02 относительно прошлой даты,
+    alert_ratio: float = 1.5  # причём относительное падение NDRE >= 1.5 x падения NDVI
 
 
 @dataclass
@@ -88,3 +92,39 @@ def detect_hidden_stress(
     mask = np.where(np.isfinite(z_re) & np.isfinite(z_vi), mask, False)
     mask = remove_small_objects(mask, cfg.min_area_px)
     return EarlyStressResult(mask=mask, z_ndre=z_re, z_ndvi=z_vi, dz_ndre=d_re, dz_ndvi=d_vi)
+
+
+def evaluate_alert(
+    hidden_fraction: float | None,
+    mean_ndre: float | None,
+    mean_ndvi: float | None,
+    prev_means: tuple[float | None, float | None] | None,
+    cfg: EarlyStressConfig | None = None,
+) -> dict:
+    """Флаг early_stress_alert и причины срабатывания.
+
+    Срабатывает, если (а) скрытый стресс занимает не меньше alert_area_fraction поля, или
+    (б) есть предыдущая дата и NDRE упал быстрее NDVI: абсолютное падение среднего NDRE не меньше
+    alert_min_ndre_drop, а относительное — не меньше alert_ratio от падения NDVI.
+    Пороги не калибровались на реальных рядах и подлежат настройке на КТ4.
+    """
+    cfg = cfg or EarlyStressConfig()
+    reasons: list[str] = []
+    if hidden_fraction is not None and hidden_fraction >= cfg.alert_area_fraction:
+        reasons.append("hidden_area")
+
+    ndre_drop = ndvi_drop = None
+    if prev_means is not None and None not in (prev_means[0], prev_means[1], mean_ndre, mean_ndvi):
+        prev_ndre, prev_ndvi = prev_means
+        ndre_drop = prev_ndre - mean_ndre  # положительное = упал
+        ndvi_drop = prev_ndvi - mean_ndvi
+        rel_ndre = ndre_drop / prev_ndre if prev_ndre else 0.0
+        rel_ndvi = ndvi_drop / prev_ndvi if prev_ndvi else 0.0
+        if ndre_drop >= cfg.alert_min_ndre_drop and rel_ndre >= cfg.alert_ratio * max(rel_ndvi, 0.005):
+            reasons.append("ndre_faster_than_ndvi")
+    return {
+        "alert": bool(reasons),
+        "reasons": reasons,
+        "ndre_drop": None if ndre_drop is None else round(float(ndre_drop), 6),
+        "ndvi_drop": None if ndvi_drop is None else round(float(ndvi_drop), 6),
+    }

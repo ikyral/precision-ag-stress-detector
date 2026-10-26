@@ -53,6 +53,7 @@ class ZoningConfig:
     max_fit_samples: int = 50_000
     silhouette_samples: int = 4_000
     random_state: int = 0
+    order_by: str = "NDRE"  # класс 1 — худший по этому признаку (ТЗ: сортировка по среднему NDRE)
 
 
 @dataclass
@@ -60,7 +61,7 @@ class ZoningResult:
     zones: np.ndarray  # uint8 [H, W]; 0 — нет данных, 1..N — классы
     n_classes: int
     labels: list[str]
-    vigor: list[float]  # средний z-композит по каждому классу (по возрастанию)
+    vigor: list[float]  # средний z-score признака order_by по классам (по возрастанию)
     k_requested: int | None = None
     silhouette: dict[int, float] = field(default_factory=dict)
 
@@ -150,8 +151,11 @@ def segment_zones(
     km = KMeans(k, n_init=10, random_state=cfg.random_state).fit(X[fit_idx])
     lab = km.predict(X)
 
-    # порядок кластеров по «жизненной силе»: 1 — хуже всех
-    vigor_centroid = km.cluster_centers_.mean(axis=1)
+    # порядок кластеров: 1 — хуже всех по order_by (по умолчанию NDRE), иначе по среднему всех признаков
+    order_idx = cfg.features.index(cfg.order_by) if cfg.order_by in cfg.features else None
+    vigor_centroid = (
+        km.cluster_centers_[:, order_idx] if order_idx is not None else km.cluster_centers_.mean(axis=1)
+    )
     rank = np.empty(k, dtype=np.int64)
     rank[np.argsort(vigor_centroid)] = np.arange(k)
 
@@ -170,8 +174,17 @@ def segment_zones(
     remap[present] = np.arange(1, len(present) + 1, dtype=np.uint8)
     cls = remap[cls]
 
-    composite = z.mean(axis=0)
-    vigor = [float(np.mean(composite[cls == i])) for i in range(1, len(present) + 1)]
+    # после сглаживания порядок мог чуть сдвинуться: финально сортируем классы по среднему order_by
+    composite = z[order_idx] if order_idx is not None else z.mean(axis=0)
+    n_final = len(present)
+    means = np.array([float(np.mean(composite[cls == i])) for i in range(1, n_final + 1)])
+    if np.any(np.diff(means) < 0):
+        new_rank = np.empty(n_final + 1, dtype=np.uint8)
+        new_rank[0] = 0
+        new_rank[1 + np.argsort(means)] = np.arange(1, n_final + 1, dtype=np.uint8)
+        cls = new_rank[cls]
+        means = np.sort(means)
+    vigor = [float(v) for v in means]
     return ZoningResult(
         zones=cls, n_classes=int(len(present)), labels=class_labels(len(present)),
         vigor=vigor, k_requested=k, silhouette=silhouette,

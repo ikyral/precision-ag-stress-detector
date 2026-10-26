@@ -9,9 +9,9 @@ import numpy as np
 from scipy import ndimage as ndi
 
 from stress_core import indices as ix
-from stress_core.early_stress import EarlyStressConfig, detect_hidden_stress
+from stress_core.early_stress import EarlyStressConfig, detect_hidden_stress, evaluate_alert
 from stress_core.geotiff_io import GeoMeta, read_geotiff, write_geotiff
-from stress_core.pipeline import analyze_scene, parse_date, run_pipeline
+from stress_core.pipeline import analyze_field, analyze_scene, parse_date, run_pipeline
 from stress_core.synthetic import make_scenes, write_demo_scenes
 from stress_core.zoning import ZoningConfig, segment_zones
 
@@ -252,8 +252,11 @@ class PipelineTest(unittest.TestCase):
 
     def test_outputs_exist_per_date(self):
         for d in ("2026_06_05", "2026_06_20", "2026_07_05"):  # контракт: YYYY_MM_DD
-            for prefix in ("zones", "hidden_stress", "indices"):
-                self.assertTrue((self.out / f"{prefix}_{d}.tif").exists(), f"{prefix}_{d}")
+            self.assertTrue((self.out / "zones" / f"zones_{d}.tif").exists(), d)
+            self.assertTrue((self.out / "hidden_stress" / f"hidden_stress_{d}.tif").exists(), d)
+            self.assertTrue((self.out / "stats" / f"index_stats_{d}.json").exists(), d)
+            for name in ("NDVI", "NDRE", "MSAVI", "NDMI"):  # по ТЗ: отдельный файл на индекс
+                self.assertTrue((self.out / "indices" / f"{name}_{d}.tif").exists(), f"{name}_{d}")
         self.assertTrue((self.out / "indices_summary.json").exists())
 
     def test_json_is_strict_and_complete(self):
@@ -295,10 +298,37 @@ class PipelineTest(unittest.TestCase):
         self.assertLess(pix[0], 100)
         self.assertEqual(pix[2], 0)
 
-    def test_index_raster_has_four_float_bands(self):
-        arr, _ = read_geotiff(self.out / "indices_2026_06_05.tif")
-        self.assertEqual(arr.shape[0], 4)
-        self.assertEqual(arr.dtype, np.float32)
+    def test_each_index_is_single_band_float_with_georeference(self):
+        _, src_geo = read_geotiff(self.inputs[0])
+        for name in ("NDVI", "NDRE", "MSAVI", "NDMI"):
+            arr, geo = read_geotiff(self.out / "indices" / f"{name}_2026_06_05.tif")
+            self.assertEqual(arr.shape, (1, 120, 160), name)
+            self.assertEqual(arr.dtype, np.float32, name)
+            self.assertEqual(geo.tiepoint, src_geo.tiepoint, name)
+            self.assertEqual(geo.epsg, 32637, name)
+
+    def test_index_stats_json_for_dashboard(self):
+        """Поля, которые читает дашборд M4: mean_* и early_stress_alert."""
+        for d in ("2026_06_05", "2026_06_20", "2026_07_05"):
+            raw = (self.out / "stats" / f"index_stats_{d}.json").read_text(encoding="utf-8")
+            self.assertNotIn("NaN", raw)
+            doc = json.loads(raw)
+            for key in ("mean_ndvi", "mean_ndre", "mean_msavi", "mean_ndmi"):
+                self.assertIsInstance(doc[key], float, key)
+            self.assertIsInstance(doc["early_stress_alert"], bool)
+            self.assertEqual(doc["date"], d.replace("_", "-"))
+            self.assertAlmostEqual(doc["field_area_ha"], doc["valid_pixels"] * 100 / 10_000, places=3)
+
+    def test_means_in_stats_match_summary(self):
+        doc = json.loads((self.out / "stats" / "index_stats_2026_06_20.json").read_text(encoding="utf-8"))
+        rec = self.summary["dates"]["2026-06-20"]
+        self.assertEqual(doc["mean_ndre"], rec["indices"]["NDRE"]["mean"])
+        self.assertEqual(doc["mean_msavi"], rec["indices"]["MSAVI2"]["mean"])
+
+    def test_alert_fires_only_when_hidden_focus_present(self):
+        alerts = {d: self.summary["dates"][d]["early_stress_alert"] for d in sorted(self.summary["dates"])}
+        self.assertEqual(alerts, {"2026-06-05": False, "2026-06-20": True, "2026-07-05": False})
+        self.assertIn("hidden_area", self.summary["dates"]["2026-06-20"]["early_stress"]["reasons"])
 
     def test_bad_scene_does_not_stop_the_run(self):
         with tempfile.TemporaryDirectory() as d:
@@ -310,6 +340,85 @@ class PipelineTest(unittest.TestCase):
         self.assertIn("error", s["dates"]["2026-06-10"])
         self.assertNotIn("error", s["dates"]["2026-06-20"])
         self.assertEqual(len(good), 3)
+
+
+class AlertRuleTest(unittest.TestCase):
+    def test_area_rule(self):
+        self.assertTrue(evaluate_alert(0.05, 0.5, 0.8, None)["alert"])
+        self.assertFalse(evaluate_alert(0.002, 0.5, 0.8, None)["alert"])
+        self.assertFalse(evaluate_alert(None, None, None, None)["alert"])
+
+    def test_dynamics_rule_ndre_falls_faster_than_ndvi(self):
+        res = evaluate_alert(0.0, 0.46, 0.80, (0.50, 0.81))  # NDRE -0.04 (-8%), NDVI -0.01 (-1.2%)
+        self.assertTrue(res["alert"])
+        self.assertEqual(res["reasons"], ["ndre_faster_than_ndvi"])
+        self.assertAlmostEqual(res["ndre_drop"], 0.04, places=6)
+
+    def test_dynamics_rule_ignores_equal_decline_and_small_noise(self):
+        self.assertFalse(evaluate_alert(0.0, 0.46, 0.75, (0.50, 0.81))["alert"])  # NDVI падает почти так же (-7% против -8%)
+        self.assertFalse(evaluate_alert(0.0, 0.495, 0.80, (0.50, 0.81))["alert"])  # падение ниже порога
+        self.assertFalse(evaluate_alert(0.0, 0.55, 0.85, (0.50, 0.81))["alert"])  # рост
+
+
+class OrderingAndEntryPointsTest(unittest.TestCase):
+    def test_class_one_is_lowest_ndre(self):
+        sc = make_scenes()[0]
+        for k in (3, 4, 5):
+            r = analyze_scene(sc.date, sc.bands, sc.geo, ZoningConfig(n_classes=k))
+            means = [float(np.nanmean(r.indices["NDRE"][r.zoning.zones == c])) for c in range(1, r.zoning.n_classes + 1)]
+            self.assertEqual(means, sorted(means), f"k={k}")
+
+    def test_analyze_field_single_scene_and_date_override(self):
+        with tempfile.TemporaryDirectory() as d:
+            d = Path(d)
+            src = write_demo_scenes(d / "in")[1]
+            nodate = d / "in" / "sample_scene.tif"  # имя без даты, как у эталона от M1
+            nodate.write_bytes(src.read_bytes())
+            with self.assertRaises(ValueError):
+                parse_date(nodate.name)
+            rec = analyze_field(nodate, d / "out", date="2026-08-07", zoning_cfg=ZoningConfig(n_classes=3))
+            self.assertEqual(rec["date"], "2026-08-07")
+            self.assertTrue((d / "out" / "zones" / "zones_2026_08_07.tif").exists())
+            self.assertTrue((d / "out" / "stats" / "index_stats_2026_08_07.json").exists())
+            rec2 = analyze_field(src, d / "out2", zoning_cfg=ZoningConfig(n_classes=3))  # дата из имени
+            self.assertEqual(rec2["date"], "2026-06-20")
+
+    def test_date_override_rejects_multiple_scenes(self):
+        with tempfile.TemporaryDirectory() as d:
+            d = Path(d)
+            write_demo_scenes(d / "in")
+            with self.assertRaises(ValueError):
+                run_pipeline([d / "in"], d / "out", date_override="2026-08-07")
+
+    def test_ten_band_scene_via_cli_preset(self):
+        """sample_scene.tif от M1: 10 каналов uint16 x10000, nodata = 0 вне поля."""
+        from stress_core.__main__ import main
+        rng = np.random.default_rng(0)
+        h = w = 60
+        yy, xx = np.mgrid[:h, :w]
+        field = (yy - 30) ** 2 + (xx - 30) ** 2 < 26 ** 2
+        base = {"B": .03, "G": .05, "R": .035, "RE1": .07, "RE2": .20, "RE3": .25, "N": .26, "N2": .27, "S1": .14, "S2": .07}
+        stack = np.stack([
+            np.where(field, np.clip(v * (1 + 0.03 * rng.standard_normal((h, w))), 1e-4, None) * 10_000, 0)
+            for v in base.values()
+        ]).astype(np.uint16)
+        with tempfile.TemporaryDirectory() as d:
+            d = Path(d)
+            write_geotiff(d / "sample_scene.tif", stack, GeoMeta.from_origin(597_610, 5_249_140, 10, 10, 32637), nodata=0)
+            code = main(["run", str(d / "sample_scene.tif"), "-o", str(d / "out"), "--bands", "s2-10", "--date", "2026-08-07"])
+            self.assertEqual(code, 0)
+            zones, _ = read_geotiff(d / "out" / "zones" / "zones_2026_08_07.tif")
+            np.testing.assert_array_equal(zones[0] > 0, field)  # маска поля = ненулевые пиксели
+            self.assertTrue(set(np.unique(zones[0])) <= {0, 1, 2, 3})
+
+    def test_indices_command_writes_plain_named_files(self):
+        from stress_core.__main__ import main
+        with tempfile.TemporaryDirectory() as d:
+            d = Path(d)
+            scene = write_demo_scenes(d / "in")[0]
+            self.assertEqual(main(["indices", str(scene), "-o", str(d / "idx")]), 0)
+            self.assertEqual(sorted(p.name for p in (d / "idx").iterdir()),
+                             ["MSAVI.tif", "NDMI.tif", "NDRE.tif", "NDVI.tif"])
 
 
 if __name__ == "__main__":
