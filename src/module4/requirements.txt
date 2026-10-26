@@ -1,0 +1,9 @@
+streamlit>=1.40
+folium>=0.17
+streamlit-folium>=0.22
+plotly>=5.20
+pandas>=2.0
+numpy>=1.24
+pillow>=10.0
+pyshp>=2.3        # только для generate_mock_data.py
+rasterio>=1.3     # растры индексов и зон Модуля 2 (GeoTIFF, UTM -> WGS84)
