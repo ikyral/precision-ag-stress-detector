@@ -9,8 +9,7 @@
 Команды выполняются из папки `src/module2` (рядом с `stress_core/`).
 
 ```bash
-pip install -r requirements.txt     # numpy, scipy, scikit-learn, tifffile, imagecodecs, matplotlib
-pip install spyndex                 # опционально (бэкенд spyndex и сверка формул)
+pip install -r requirements.txt     # numpy, scipy, scikit-learn, tifffile, imagecodecs, matplotlib, spyndex
 
 # серия сцен -> data/zones, data/stats, data/indices, data/hidden_stress
 python -m stress_core run ../../data/scenes -o ../../data
@@ -130,4 +129,4 @@ rec = analyze_field("data/scenes/scene_2026_08_14.tif")
 - Пороги правила `decline` подобраны на одном поле и одном сезоне (2026, 8 дат) по совпадению с последующим обвалом NDVI, полевой разметки (что это было — болезнь, засуха, неравномерное созревание) нет. Северо-восточное пятно 18–28 июля, по данным M1, скорее другая фаза развития посева, а не стресс; отметки вдоль колеи дождевальной машины — постоянный объект. На другом поле или культуре пороги нужно проверять заново (`python -m stress_core season`).
 - Пояс шириной 1 px по краю поля не классифицируется сам, а наследует класс соседей: реальный очаг шириной в один пиксель у самой границы будет сглажен.
 - Xarray и rasterio не используются: расчёт на NumPy, GeoTIFF через tifffile. Повёрнутые растры (ModelTransformation без шага пикселя) читаются, но площадь для них не считается.
-- Бэкенд `spyndex` (`--backend spyndex`) проверен тестом на машине автора; в окружении без пакета тест пропускается.
+- Основной расчёт индексов — NumPy. Пакет `spyndex` входит в `requirements.txt`: он нужен для бэкенда `--backend spyndex` и для теста `test_matches_spyndex`, который сверяет формулы NumPy со spyndex. Если пакет не установлен, расчёт работает, а этот тест пропускается.

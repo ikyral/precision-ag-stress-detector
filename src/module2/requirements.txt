@@ -4,3 +4,4 @@ scikit-learn
 tifffile
 imagecodecs
 matplotlib
+spyndex
