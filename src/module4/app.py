@@ -26,6 +26,7 @@ Precision Ag Stress Detector — Модуль 4. Веб-кабинет агро�
 from __future__ import annotations
 
 import copy
+import html
 import json
 import os
 import re
@@ -63,6 +64,9 @@ ZONE_SHORT = {1: "Острый стресс", 2: "Умеренный стрес�
 ZONE_NAMES = {1: "Острый стресс (макс. доза)", 2: "Умеренный стресс (средняя доза)", 3: "Норма (без обработки)"}
 DEFAULT_RATE_FACTORS = {1: 1.0, 2: round(80 / 150, 4), 3: 0.0}  # доли от базовой нормы
 DEFAULT_BASE_RATE, DEFAULT_PRICE = 150, 45
+BASE_RATE_RANGE, PRICE_RANGE = (50, 300), (10, 150)  # границы слайдеров
+MAX_RATE_FACTOR = 2.0  # доля нормы выше этого — скорее всего проценты вместо долей
+MAX_OVERLAY_PX = 1600  # растр крупнее не увеличиваем «блоками»
 
 LAYERS = {
     "Карта предписаний VRA": None,
@@ -125,6 +129,31 @@ def fmt_num(x: float, digits: int = 0) -> str:
     return f"{x:,.{digits}f}".replace(",", " ").replace(".", ",")
 
 
+def clamp(x: float, bounds: tuple[float, float]) -> float:
+    return min(max(x, bounds[0]), bounds[1])
+
+
+# Проблемы с данными собираются за один прогон скрипта и выводятся блоком вверху страницы:
+# дашборд по-прежнему показывает то, что смог прочитать, но ничего не подменяет молча.
+PROBLEMS: list[str] = []
+
+
+def report(msg: str) -> None:
+    if msg not in PROBLEMS:
+        PROBLEMS.append(msg)
+
+
+def as_number(x) -> float | None:
+    """Число из JSON или None (null, строка-не-число, bool, NaN)."""
+    if x is None or isinstance(x, bool):
+        return None
+    try:
+        v = float(x)
+    except (TypeError, ValueError):
+        return None
+    return v if np.isfinite(v) else None
+
+
 def _read_json(path: Path):
     with open(path, encoding="utf-8") as f:
         return json.load(f)
@@ -136,10 +165,18 @@ def load_json(path: str, mtime: float = 0.0):
     return _read_json(p) if p.exists() else None
 
 
-def jload(path: Path | None):
+def jload(path: Path | None) -> dict | None:
     if path is None or not path.exists():
         return None
-    return load_json(str(path), path.stat().st_mtime)
+    try:
+        data = load_json(str(path), path.stat().st_mtime)
+    except (json.JSONDecodeError, UnicodeDecodeError, OSError) as e:
+        report(f"`{path.name}` не читается как JSON ({e}) — файл пропущен.")
+        return None
+    if not isinstance(data, dict):
+        report(f"`{path.name}`: ожидался JSON-объект, а не {type(data).__name__} — файл пропущен.")
+        return None
+    return data
 
 
 # ----------------------------------------------------------------------------
@@ -175,16 +212,20 @@ class DataSource:
         return None
 
     def dates(self) -> list[str]:
-        found = set()
-        for p in (self.root / "stats").glob("index_stats_*.json"):
-            m = DATE_RE.search(p.stem)
-            if m:
-                found.add(m.group(1))
+        stems = [p.stem for p in (self.root / "stats").glob("index_stats_*.json")]
         for sub in VRA_SUBDIRS:
-            for p in (self.root / sub).glob("metrics_*.json"):
-                m = DATE_RE.search(p.stem)
-                if m:
-                    found.add(m.group(1))
+            stems += [p.stem for p in (self.root / sub).glob("metrics_*.json")]
+        found = set()
+        for stem in stems:
+            m = DATE_RE.search(stem)
+            if not m:
+                continue
+            try:
+                parse_date(m.group(1))
+            except ValueError:
+                report(f"`{stem}`: некорректная дата в имени файла — файл пропущен.")
+                continue
+            found.add(m.group(1))
         return sorted(found)
 
     def field_boundary(self):
@@ -193,19 +234,26 @@ class DataSource:
                 return jload(p)
         return None
 
+    def _stats_file(self, stats: dict | None, *keys: str) -> Path | None:
+        """Путь из блока files.* статистики M2 (если он есть и существует)."""
+        node = stats or {}
+        for k in keys:
+            node = node.get(k) if isinstance(node, dict) else None
+        if not isinstance(node, str) or not node:
+            return None
+        p = self.root / node
+        if not p.exists():
+            report(f"index_stats ссылается на `{node}`, но такого файла нет — ищу по стандартному пути.")
+            return None
+        return p
+
     def index_raster(self, index: str, d: str, stats: dict | None) -> Path | None:
-        rel = ((stats or {}).get("files") or {}).get("indices", {}).get(index)
-        for p in ([self.root / rel] if rel else []) + [self.root / "indices" / f"{index}_{d}.tif"]:
-            if p.exists():
-                return p
-        return None
+        p = self._stats_file(stats, "files", "indices", index) or self.root / "indices" / f"{index}_{d}.tif"
+        return p if p.exists() else None
 
     def zones_raster(self, d: str, stats: dict | None) -> Path | None:
-        rel = ((stats or {}).get("files") or {}).get("zones")
-        for p in ([self.root / rel] if rel else []) + [self.root / "zones" / f"zones_{d}.tif"]:
-            if p.exists():
-                return p
-        return None
+        p = self._stats_file(stats, "files", "zones") or self.root / "zones" / f"zones_{d}.tif"
+        return p if p.exists() else None
 
     def overlay_png(self, index: str, d: str) -> Path | None:
         p = self.root / "overlays" / f"{index}_{d}.png"
@@ -233,9 +281,13 @@ def colorize_zones(arr: np.ndarray) -> np.ndarray:
     return out
 
 
-def upscale(rgba: np.ndarray, k: int = 4) -> np.ndarray:
-    """Увеличение «блоками», чтобы пиксели 10 м не размывались браузером."""
-    return np.repeat(np.repeat(rgba, k, axis=0), k, axis=1)
+def upscale(rgba: np.ndarray) -> np.ndarray:
+    """Увеличение «блоками», чтобы пиксели 10 м не размывались браузером.
+
+    Крупные растры не увеличиваем: иначе картинка на десятки МБ пересобирается при каждом движении слайдера.
+    """
+    k = max(1, min(4, MAX_OVERLAY_PX // max(rgba.shape[:2])))
+    return np.repeat(np.repeat(rgba, k, axis=0), k, axis=1) if k > 1 else rgba
 
 
 @st.cache_data(show_spinner=False)
@@ -245,9 +297,9 @@ def read_geotiff_wgs84(path: str, mtime: float):
     Возвращает (array float32 с NaN вместо nodata, bounds [[S, W], [N, E]]).
     """
     with rasterio.open(path) as src:
-        arr = src.read(1).astype("float32")
-        if src.nodata is not None and not np.isnan(src.nodata):
-            arr[arr == src.nodata] = np.nan
+        if src.crs is None:
+            raise ValueError("в файле не задана система координат (CRS)")
+        arr = src.read(1, masked=True).astype("float32").filled(np.nan)  # учитывает nodata и маску
         dst_crs = "EPSG:4326"
         transform, w, h = calculate_default_transform(src.crs, dst_crs, src.width, src.height, *src.bounds)
         dst = np.full((h, w), np.nan, dtype="float32")
@@ -257,6 +309,15 @@ def read_geotiff_wgs84(path: str, mtime: float):
     west, north = transform * (0, 0)
     east, south = transform * (w, h)
     return dst, [[south, west], [north, east]]
+
+
+def load_raster(tif: Path):
+    """read_geotiff_wgs84 без падения страницы: битый, недописанный или без CRS файл → (None, None)."""
+    try:
+        return read_geotiff_wgs84(str(tif), tif.stat().st_mtime)
+    except (rasterio.errors.RasterioError, ValueError, OSError) as e:
+        report(f"`{tif.name}` не открывается: {e}")
+        return None, None
 
 
 def index_overlay(ds: DataSource, index: str, d: str, stats, meta, vrange):
@@ -269,7 +330,9 @@ def index_overlay(ds: DataSource, index: str, d: str, stats, meta, vrange):
         return None, None, f"Растр {index} за {fmt_date(d)} не найден."
     if not HAS_RASTERIO:
         return None, None, "Для показа GeoTIFF установите rasterio: pip install rasterio"
-    arr, bounds = read_geotiff_wgs84(str(tif), tif.stat().st_mtime)
+    arr, bounds = load_raster(tif)
+    if arr is None:
+        return None, None, f"Растр {index} за {fmt_date(d)} не удалось прочитать."
     return upscale(colorize(arr, *vrange, INDEX_CMAPS[index])), bounds, "tif"
 
 
@@ -277,20 +340,34 @@ def zones_overlay(ds: DataSource, d: str, stats):
     tif = ds.zones_raster(d, stats)
     if tif is None or not HAS_RASTERIO:
         return None, None
-    arr, bounds = read_geotiff_wgs84(str(tif), tif.stat().st_mtime)
-    return upscale(colorize_zones(np.nan_to_num(arr, nan=0).astype(np.uint8))), bounds
+    arr, bounds = load_raster(tif)
+    if arr is None:
+        return None, None
+    zones = np.nan_to_num(arr, nan=0)
+    if not np.isin(zones, list(ZONE_COLORS)).any():
+        values = ", ".join(f"{v:g}" for v in np.unique(zones)[:10])
+        report(f"`{tif.name}`: нет пикселей с классами 1–3 (значения в файле: {values}).")
+        return None, None
+    return upscale(colorize_zones(zones.astype(np.uint8))), bounds
+
+
+def index_block(stats: dict, index: str) -> dict | None:
+    """Блок indices.<NDVI|NDRE|MSAVI2|NDMI> из index_stats M2."""
+    indices = stats.get("indices") if isinstance(stats.get("indices"), dict) else {}
+    return next((indices[k] for k in STATS_INDEX_KEYS[index] if isinstance(indices.get(k), dict)), None)
 
 
 def season_ranges(stats_by_date: dict, meta: dict) -> dict:
     """Единая шкала на весь сезон: min(p5)…max(p95) по всем датам M2."""
     ranges = {k: tuple(v) for k, v in DEFAULT_RANGES.items()}
     ranges.update({k: tuple(v) for k, v in (meta.get("index_ranges") or {}).items()})
-    for index, keys in STATS_INDEX_KEYS.items():
+    for index in STATS_INDEX_KEYS:
         lo, hi = [], []
         for s in stats_by_date.values():
-            block = next(((s.get("indices") or {}).get(k) for k in keys if (s.get("indices") or {}).get(k)), None)
-            if block and block.get("p5") is not None and block.get("p95") is not None:
-                lo.append(block["p5"]); hi.append(block["p95"])
+            block = index_block(s, index) or {}
+            p5, p95 = as_number(block.get("p5")), as_number(block.get("p95"))
+            if p5 is not None and p95 is not None:
+                lo.append(p5); hi.append(p95)
         if lo and max(hi) > min(lo):
             pad = 0.05 * (max(hi) - min(lo))
             ranges[index] = (round(min(lo) - pad, 3), round(max(hi) + pad, 3))
@@ -300,37 +377,99 @@ def season_ranges(stats_by_date: dict, meta: dict) -> dict:
 # ----------------------------------------------------------------------------
 # Экономика
 # ----------------------------------------------------------------------------
+def parse_zone(raw, src: str) -> dict | None:
+    """Проверяет запись зоны (zone_class|class, area_ha). Негодную пропускает и пишет в PROBLEMS."""
+    if not isinstance(raw, dict):
+        report(f"{src}: запись зоны не является объектом — пропущена.")
+        return None
+    zc, area = as_number(raw.get("zone_class", raw.get("class"))), as_number(raw.get("area_ha"))
+    if zc is None or area is None:
+        missing = [k for k, v in (("zone_class", zc), ("area_ha", area)) if v is None]
+        report(f"{src}: у зоны нет корректного поля {', '.join(missing)} — зона пропущена.")
+        return None
+    if int(zc) not in ZONE_COLORS:
+        report(f"{src}: неизвестный класс зоны {zc:g} (ожидаются 1, 2, 3) — зона не учтена.")
+        return None
+    return {**raw, "zone_class": int(zc), "area_ha": area}
+
+
+def zone_file_rate(z: dict) -> float | None:
+    return as_number(z.get("rate_kg_ha", z.get("fertilizer_rate")))
+
+
+def file_base_rate(metrics: dict) -> float | None:
+    """Базовая норма, с которой M3 считал файл; если её нет — максимальная норма зоны (доза зоны 1)."""
+    base = as_number(metrics.get("base_rate_kg_ha"))
+    if base and base > 0:
+        return base
+    rates = [r for z in metrics.get("zone_breakdown") or [] if isinstance(z, dict)
+             if (r := zone_file_rate(z)) is not None]
+    return max(rates) if rates and max(rates) > 0 else None
+
+
 def metrics_from_stats(stats: dict | None) -> dict | None:
     """Если M3 ещё не выдал metrics_*.json — собираем разбивку по зонам из index_stats M2."""
-    classes = ((stats or {}).get("zones") or {}).get("classes") or []
-    if not classes:
+    zones_block = (stats or {}).get("zones")
+    classes = zones_block.get("classes") if isinstance(zones_block, dict) else None
+    if not isinstance(classes, list) or not classes:
+        return None
+    zones = [z for z in (parse_zone(c, "index_stats (M2)") for c in classes) if z]
+    if not zones:
         return None
     return {
         "base_rate_kg_ha": DEFAULT_BASE_RATE, "price_per_kg": DEFAULT_PRICE, "_source": "m2",
         "zone_breakdown": [{
-            "zone_class": int(c["class"]), "zone_name": ZONE_NAMES.get(int(c["class"]), c.get("label", "")),
-            "area_ha": float(c.get("area_ha", 0.0)),
-            "rate_factor": DEFAULT_RATE_FACTORS.get(int(c["class"]), 0.0),
-        } for c in classes],
+            "zone_class": z["zone_class"], "zone_name": ZONE_NAMES[z["zone_class"]], "area_ha": z["area_ha"],
+            "rate_factor": DEFAULT_RATE_FACTORS[z["zone_class"]],
+        } for z in zones],
     }
 
 
-def recompute_economics(metrics: dict, base_rate: float, price: float) -> dict:
-    """Норма зоны = base_rate * rate_factor; rate_factor берётся из файла
-    или выводится как rate_kg_ha / base_rate_kg_ha (с которыми файл был рассчитан)."""
-    file_base = metrics.get("base_rate_kg_ha") or 0.0
-    zones = []
-    for z in metrics.get("zone_breakdown", []):
-        zc = int(z["zone_class"])
-        factor = z.get("rate_factor")
-        if factor is None:
-            file_rate = z.get("rate_kg_ha", z.get("fertilizer_rate"))
-            factor = (file_rate / file_base) if (file_rate is not None and file_base) else DEFAULT_RATE_FACTORS.get(zc, 0)
+def zone_rate_factor(z: dict, file_base: float | None, src: str) -> tuple[float, bool]:
+    """(доля от базовой нормы, взята ли доля по умолчанию).
+
+    Порядок: rate_factor из файла → норма зоны / базовая норма файла → 100% / 53% / 0%.
+    """
+    factor = as_number(z.get("rate_factor"))
+    if factor is None:
+        file_rate = zone_file_rate(z)
+        if file_rate is None or not file_base:
+            return DEFAULT_RATE_FACTORS[z["zone_class"]], True
+        factor = file_rate / file_base
+    if not 0 <= factor <= MAX_RATE_FACTOR:
+        report(f"{src}: доля нормы зоны {z['zone_class']} = {factor:g} вне диапазона 0–{MAX_RATE_FACTOR:g} "
+               "(проценты вместо долей?).")
+    return factor, False
+
+
+def recompute_economics(metrics: dict, base_rate: float, price: float) -> dict | None:
+    """Норма зоны = base_rate * rate_factor (см. zone_rate_factor). None — ни одной годной зоны."""
+    from_m2 = metrics.get("_source") == "m2"
+    src = "index_stats (M2)" if from_m2 else "metrics (M3)"
+    file_base = file_base_rate(metrics)
+    if not from_m2 and file_base and as_number(metrics.get("base_rate_kg_ha")) is None:
+        report(f"В {src} нет base_rate_kg_ha — базовой принята максимальная норма зоны, {fmt_num(file_base)} кг/га.")
+    zones, defaulted = [], []
+    for raw in metrics.get("zone_breakdown") or []:
+        z = parse_zone(raw, src)
+        if z is None:
+            continue
+        zc = z["zone_class"]
+        factor, is_default = zone_rate_factor(z, file_base, src)
+        if is_default:
+            defaulted.append(ZONE_SHORT[zc])
         rate = base_rate * factor
-        zones.append({**z, "zone_class": zc, "zone_name": z.get("zone_name") or ZONE_NAMES.get(zc, f"Зона {zc}"),
+        zones.append({**z, "zone_name": z.get("zone_name") or ZONE_NAMES[zc],
                       "rate_factor": factor, "rate_kg_ha": round(rate, 1), "total_kg": z["area_ha"] * rate})
+    if defaulted and not from_m2:
+        report(f"В {src} нет норм для зон: {', '.join(defaulted)} — подставлены нормы по умолчанию (100% / 53% / 0%).")
+    if not zones:
+        report(f"В {src} нет ни одной годной зоны — экономика не рассчитана.")
+        return None
     zones.sort(key=lambda z: z["zone_class"])
     total = sum(z["area_ha"] for z in zones)
+    if total <= 0:
+        report(f"В {src} суммарная площадь зон равна 0 — проверьте поле area_ha и единицы (нужны гектары).")
     stressed = sum(z["area_ha"] for z in zones if z["zone_class"] in (1, 2))
     uniform = total * base_rate
     smart = sum(z["total_kg"] for z in zones)
@@ -353,29 +492,64 @@ def geojson_bounds(gj):
     lons, lats = [], []
 
     def walk(c):
-        if c and isinstance(c[0], (int, float)):
+        if not isinstance(c, (list, tuple)) or not c:
+            return
+        if isinstance(c[0], (int, float)) and len(c) >= 2:
             lons.append(c[0]); lats.append(c[1])
         else:
             for x in c:
                 walk(x)
 
-    for f in gj.get("features", []):
-        walk(f["geometry"]["coordinates"])
+    for f in gj.get("features") or []:
+        geom = f.get("geometry") if isinstance(f, dict) else None
+        if isinstance(geom, dict):
+            walk(geom.get("coordinates"))
     return [[min(lats), min(lons)], [max(lats), max(lons)]] if lats else None
 
 
-def normalize_prescription(gj, econ):
-    """Приводит свойства M3 к единому виду (fertilizer_rate | rate_kg_ha → rate_kg_ha)
-    и подставляет нормы, пересчитанные под слайдер базовой нормы."""
+def checked_wgs84(gj, name: str):
+    """GeoJSON в градусах EPSG:4326 или None: файл в UTM иначе молча уводит карту в другое место."""
+    b = geojson_bounds(gj)
+    if b and (abs(b[0][0]) > 90 or abs(b[1][0]) > 90 or abs(b[0][1]) > 180 or abs(b[1][1]) > 180):
+        report(f"`{name}`: координаты не в градусах EPSG:4326 (похоже на UTM) — слой не показан.")
+        return None
+    return gj
+
+
+def normalize_prescription(gj, rates: dict | None, name: str):
+    """Приводит свойства M3 к единому виду: zone_class, zone_name, area_ha, rate_kg_ha
+    (их ждёт подсказка карты; fertilizer_rate → rate_kg_ha).
+
+    rates — нормы, пересчитанные под слайдер; None — оставить нормы из файла.
+    Возвращает None, если в файле нет ни одного полигона.
+    """
     gj = copy.deepcopy(gj)
-    rates = {z["zone_class"]: z["rate_kg_ha"] for z in econ["zones"]}
-    for f in gj.get("features", []):
-        p = f.setdefault("properties", {})
-        zc = int(p.get("zone_class", 0))
-        p["zone_class"] = zc
-        p["zone_name"] = p.get("zone_name") or ZONE_NAMES.get(zc, f"Зона {zc}")
-        p["rate_kg_ha"] = rates.get(zc, p.get("rate_kg_ha", p.get("fertilizer_rate")))
-        p["area_ha"] = round(float(p.get("area_ha") or 0.0), 2)
+    features, no_geom, unknown = [], 0, 0
+    for f in gj.get("features") or []:
+        geom = f.get("geometry") if isinstance(f, dict) else None
+        if not isinstance(geom, dict) or not geom.get("coordinates"):
+            no_geom += 1
+            continue
+        p = f["properties"] if isinstance(f.get("properties"), dict) else {}
+        zc_num = as_number(p.get("zone_class", p.get("class")))
+        zc = int(zc_num) if zc_num is not None else 0
+        unknown += zc not in ZONE_COLORS
+        file_rate = zone_file_rate(p)
+        rate = rates.get(zc, file_rate) if rates else file_rate
+        area = as_number(p.get("area_ha"))
+        f["properties"] = {**p, "zone_class": zc,
+                           "zone_name": p.get("zone_name") or ZONE_NAMES.get(zc, "Неизвестная зона"),
+                           "area_ha": round(area, 2) if area is not None else "—",
+                           "rate_kg_ha": round(rate, 1) if rate is not None else "—"}
+        features.append(f)
+    if no_geom:
+        report(f"`{name}`: {no_geom} объект(ов) без геометрии — пропущены.")
+    if unknown:
+        report(f"`{name}`: у {unknown} полигон(ов) нет zone_class 1–3 — они серые и без нормы.")
+    if not features:
+        report(f"`{name}`: нет ни одного полигона — слой предписания не показан.")
+        return None
+    gj["features"] = features
     return gj
 
 
@@ -433,6 +607,16 @@ def legend_html(index, vrange):
 # ----------------------------------------------------------------------------
 # Графики
 # ----------------------------------------------------------------------------
+def series_value(stats: dict, key: str, index: str) -> float | None:
+    """Среднее индекса за дату: mean_<index> → (для MSAVI) mean_msavi2 → indices.<INDEX>.mean."""
+    v = as_number(stats.get(key))
+    if v is None and index == "MSAVI":
+        v = as_number(stats.get("mean_msavi2"))
+    if v is None:
+        v = as_number((index_block(stats, index) or {}).get("mean"))
+    return v
+
+
 def index_history_chart(hist: pd.DataFrame, selected: datetime):
     fig = go.Figure()
     for key, label, color in INDEX_SERIES:
@@ -482,22 +666,42 @@ def show_plotly(fig):
         st.plotly_chart(fig, use_container_width=True, config={"displaylogo": False})
 
 
+def early_stress_info(stats: dict) -> dict:
+    es = stats.get("early_stress")
+    return es if isinstance(es, dict) else {}
+
+
+def early_stress_flag(stats: dict) -> bool | None:
+    """Флаг раннего стресса M2; None — флага нет или он непонятного вида (не путать с «стресса нет»)."""
+    raw = stats.get("early_stress_alert", early_stress_info(stats).get("alert"))
+    if isinstance(raw, bool):
+        return raw
+    if isinstance(raw, str) and raw.strip().lower() in ("true", "false"):
+        return raw.strip().lower() == "true"
+    return None
+
+
 def stress_banner(stats: dict | None):
     if not stats:
         return
-    es = stats.get("early_stress") or {}
-    alert = bool(stats.get("early_stress_alert", es.get("alert", False)))
+    alert = early_stress_flag(stats)
+    if alert is None:
+        st.warning("В index_stats нет флага `early_stress_alert` (true/false) — статус раннего стресса неизвестен.")
+        return
     if not alert:
         st.markdown('<div class="pas-ok">✅ Ранних признаков скрытого стресса на этой дате не обнаружено.</div>',
                     unsafe_allow_html=True)
         return
     details = []
-    if stats.get("early_stress_area_ha"):
-        details.append(f"Площадь скрытого стресса: <b>{fmt_num(stats['early_stress_area_ha'], 1)} га</b>"
-                       f" ({fmt_num(stats.get('early_stress_percent', 0), 1)}% поля).")
-    if "ndre_change_pct" in stats and "ndvi_change_pct" in stats:
-        details.append(f"За неделю NDRE {stats['ndre_change_pct']:+.1f}% против NDVI {stats['ndvi_change_pct']:+.1f}%.")
-    reasons = "".join(f"<li>{r}</li>" for r in (es.get("reasons") or []))
+    area, pct = as_number(stats.get("early_stress_area_ha")), as_number(stats.get("early_stress_percent"))
+    if area:
+        details.append(f"Площадь скрытого стресса: <b>{fmt_num(area, 1)} га</b> ({fmt_num(pct or 0, 1)}% поля).")
+    ndre, ndvi = as_number(stats.get("ndre_change_pct")), as_number(stats.get("ndvi_change_pct"))
+    if ndre is not None and ndvi is not None:
+        details.append(f"За неделю NDRE {ndre:+.1f}% против NDVI {ndvi:+.1f}%.")
+    reasons_list = early_stress_info(stats).get("reasons")
+    reasons = "".join(f"<li>{html.escape(str(r))}</li>"
+                      for r in (reasons_list if isinstance(reasons_list, list) else []))
     st.markdown(
         '<div class="pas-alert">⚠️ <b>Внимание: зафиксировано падение индекса NDRE в Red Edge спектре!</b> '
         "Скрытый хлорофилловый стресс за 10–14 дней до видимого пожелтения. "
@@ -531,7 +735,7 @@ if not dates:
 stats_by_date = {d: jload(ds.stats_path(d)) for d in dates}
 stats_by_date = {d: s for d, s in stats_by_date.items() if s}
 meta = jload(ds.root / "overlays" / "meta.json") or {}
-field_gj = ds.field_boundary()
+field_gj = checked_wgs84(ds.field_boundary(), "field_boundary.geojson")
 field_name = meta.get("field_name")
 if not field_name and field_gj and field_gj.get("features"):
     field_name = (field_gj["features"][0].get("properties") or {}).get("name")
@@ -550,13 +754,20 @@ with st.sidebar:
 
     stats = stats_by_date.get(sel_date)
     metrics_path = ds.vra_file(f"metrics_{sel_date}.json")
-    metrics = jload(metrics_path) or metrics_from_stats(stats) or {}
+    m3_metrics = jload(metrics_path)
+    if m3_metrics is not None and not isinstance(m3_metrics.get("zone_breakdown"), list):
+        report(f"`{metrics_path.name}`: нет списка zone_breakdown — экономика посчитана по данным Модуля 2.")
+        m3_metrics = None
+    metrics = m3_metrics or metrics_from_stats(stats) or {}
+    file_base = file_base_rate(metrics)
+    file_price = as_number(metrics.get("price_per_kg"))
 
     st.divider()
     st.markdown("**Параметры экономики**")
-    base_rate = st.slider("Базовая норма удобрений, кг/га", 50, 300,
-                          int(metrics.get("base_rate_kg_ha") or DEFAULT_BASE_RATE), step=5)
-    price = st.slider("Цена удобрения, ₽/кг", 10, 150, int(metrics.get("price_per_kg") or DEFAULT_PRICE), step=1)
+    base_rate = st.slider("Базовая норма удобрений, кг/га", *BASE_RATE_RANGE,
+                          int(round(clamp(file_base or DEFAULT_BASE_RATE, BASE_RATE_RANGE))), step=5)
+    price = st.slider("Цена удобрения, ₽/кг", *PRICE_RANGE,
+                      int(round(clamp(file_price or DEFAULT_PRICE, PRICE_RANGE))), step=1)
 
     st.divider()
     st.markdown("**Файлы для бортового компьютера**")
@@ -570,14 +781,16 @@ with st.sidebar:
                            file_name=zip_path.name, mime="application/zip")
     if not gj_path and not zip_path:
         st.caption("Файлы-задания появятся, когда Модуль 3 сформирует предписание за эту дату.")
-    elif metrics.get("base_rate_kg_ha") and base_rate != metrics["base_rate_kg_ha"]:
-        st.caption(f"Файлы рассчитаны для нормы {fmt_num(metrics['base_rate_kg_ha'])} кг/га.")
+    elif m3_metrics and file_base and base_rate != round(file_base):
+        st.caption(f"Файлы рассчитаны для нормы {fmt_num(file_base)} кг/га.")
     st.caption(f"Данные: `{ds.root}`")
 
 # --- Шапка
 st.markdown(f"### {field_name}")
-st.caption(f"Снимок Sentinel-2 L2A от {fmt_date(sel_date)} · слой: {layer_label}")
+mock_note = " · ⚠️ демонстрационные мок-данные" if ds.root == APP_DIR / "mock_data" else ""
+st.caption(f"Снимок Sentinel-2 L2A от {fmt_date(sel_date)} · слой: {layer_label}{mock_note}")
 stress_banner(stats)
+problems_box = st.container()  # заполняется в конце, когда известны все проблемы с данными
 
 # --- KPI
 econ = recompute_economics(metrics, base_rate, price) if metrics.get("zone_breakdown") else None
@@ -602,8 +815,11 @@ else:
 # --- Карта и графики
 left, right = st.columns([3, 2], gap="medium")
 with left:
-    presc = jload(gj_path)
-    presc = normalize_prescription(presc, econ) if (presc and econ) else presc
+    presc = checked_wgs84(jload(gj_path), gj_path.name) if gj_path else None
+    if presc:
+        # нормы по умолчанию из M2 не должны подменять реальные нормы M3 в подсказках
+        rates = {z["zone_class"]: z["rate_kg_ha"] for z in econ["zones"]} if econ and m3_metrics else None
+        presc = normalize_prescription(presc, rates, gj_path.name)
     rgba, rbounds = None, None
     if index_name:
         rgba, rbounds, info = index_overlay(ds, index_name, sel_date, stats, meta, vranges[index_name])
@@ -622,11 +838,15 @@ with left:
 with right:
     rows = []
     for d, s in stats_by_date.items():
-        es = s.get("early_stress") or {}
-        rows.append({"dt": parse_date(d), "alert": bool(s.get("early_stress_alert", es.get("alert", False))),
-                     **{k: s.get(k) for k, _, _ in INDEX_SERIES}})
-    hist = pd.DataFrame(rows).sort_values("dt") if rows else pd.DataFrame()
+        rows.append({"dt": parse_date(d), "alert": bool(early_stress_flag(s)),
+                     **{key: series_value(s, key, index) for key, index, _ in INDEX_SERIES}})
+    hist = pd.DataFrame(rows, dtype=object).sort_values("dt") if rows else pd.DataFrame()
     if not hist.empty:
+        hist[[key for key, _, _ in INDEX_SERIES]] = hist[[key for key, _, _ in INDEX_SERIES]].astype(float)
+        missing = [index for key, index, _ in INDEX_SERIES if hist[key].isna().all()]
+        if missing:
+            report(f"В index_stats нет средних значений для {', '.join(missing)} "
+                   f"(ожидаются поля {', '.join('mean_' + i.lower() for i in missing)}) — линии не показаны.")
         show_plotly(index_history_chart(hist, parse_date(sel_date)))
         if len(hist) == 1:
             st.caption("Пока доступна одна дата — динамика появится, когда Модуль 1 выгрузит серию снимков.")
@@ -641,3 +861,7 @@ if econ:
             "Зона": z["zone_name"], "Площадь, га": round(z["area_ha"], 2), "Норма, кг/га": z["rate_kg_ha"],
             "Удобрения, кг": round(z["total_kg"], 1), "Стоимость, ₽": round(z["total_kg"] * price),
         } for z in econ["zones"]]), hide_index=True)
+
+if PROBLEMS:
+    with problems_box.expander(f"⚠️ Проблемы с данными ({len(PROBLEMS)})", expanded=True):
+        st.markdown("\n".join(f"- {p}" for p in PROBLEMS))
