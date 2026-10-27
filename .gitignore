@@ -11,6 +11,8 @@ secrets/
 data/*
 !data/samples/
 !data/README.md
+!data/scenes/
+data/scenes/preview/
 *.aux.xml
 *.ovr
 *.tmp
