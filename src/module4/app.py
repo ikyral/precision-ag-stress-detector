@@ -12,7 +12,7 @@ Precision Ag Stress Detector — Модуль 4. Веб-кабинет агро�
 
 Что читается из папки данных (всё необязательно, дашборд показывает то, что есть):
   field_boundary.geojson | samples/field_boundary.geojson   граница поля (M1)
-  stats/index_stats_YYYY_MM_DD.json                          статистика M2 (schema 1.1)
+  stats/index_stats_YYYY_MM_DD.json                          статистика M2 (schema 1.1/1.2)
   indices/{NDVI|NDRE|MSAVI|NDMI}_YYYY_MM_DD.tif              растры индексов M2 (нужен rasterio)
   zones/zones_YYYY_MM_DD.tif                                 маска зон M2 (нужен rasterio)
   vra/ | prescriptions/ | . :
@@ -27,6 +27,7 @@ from __future__ import annotations
 
 import copy
 import json
+import math
 import os
 import re
 from datetime import datetime
@@ -61,7 +62,7 @@ DATE_RE = re.compile(r"(\d{4}_\d{2}_\d{2})")
 ZONE_COLORS = {1: "#e74c3c", 2: "#f39c12", 3: "#2ecc71"}
 ZONE_SHORT = {1: "Острый стресс", 2: "Умеренный стресс", 3: "Норма"}
 ZONE_NAMES = {1: "Острый стресс (макс. доза)", 2: "Умеренный стресс (средняя доза)", 3: "Норма (без обработки)"}
-DEFAULT_RATE_FACTORS = {1: 1.0, 2: round(80 / 150, 4), 3: 0.0}  # доли от базовой нормы
+DEFAULT_RATE_FACTORS = {1: 1.0, 2: 80 / 150, 3: 0.0}  # не округляем нормы при расчёте
 DEFAULT_BASE_RATE, DEFAULT_PRICE = 150, 45
 
 LAYERS = {
@@ -94,6 +95,8 @@ st.markdown(
           border-radius: 12px; padding: 12px 16px;
       }
       div[data-testid="stMetricLabel"] p {font-size: 0.86rem; opacity: 0.8;}
+      div[data-testid="stMetricValue"] {font-size: 1.3rem;}
+      div[data-testid="stMetricValue"] > div {white-space: normal; overflow-wrap: anywhere;}
       .pas-alert {background: rgba(231, 76, 60, 0.12); border-left: 6px solid #e74c3c;
                   border-radius: 8px; padding: 12px 16px; margin: 4px 0 14px 0; font-size: 0.98rem;}
       .pas-alert ul {margin: 6px 0 0 0;}
@@ -318,30 +321,50 @@ def metrics_from_stats(stats: dict | None) -> dict | None:
 def recompute_economics(metrics: dict, base_rate: float, price: float) -> dict:
     """Норма зоны = base_rate * rate_factor; rate_factor берётся из файла
     или выводится как rate_kg_ha / base_rate_kg_ha (с которыми файл был рассчитан)."""
-    file_base = metrics.get("base_rate_kg_ha") or 0.0
+    if metrics.get("quantity_unit", "kg") != "kg":
+        raise ValueError("This dashboard supports kilogram prescriptions only")
+    file_base = metrics.get("base_rate_kg_ha", metrics.get("base_rate"))
     zones = []
     for z in metrics.get("zone_breakdown", []):
         zc = int(z["zone_class"])
         factor = z.get("rate_factor")
+        file_rate = z.get("rate_kg_ha", z.get("fertilizer_rate"))
         if factor is None:
-            file_rate = z.get("rate_kg_ha", z.get("fertilizer_rate"))
             factor = (file_rate / file_base) if (file_rate is not None and file_base) else DEFAULT_RATE_FACTORS.get(zc, 0)
-        rate = base_rate * factor
+        # With zero reference baseline a scale factor is undefined; retain the
+        # explicit prescription rates while changing only the comparison baseline.
+        rate = file_rate if file_base == 0 and file_rate is not None else base_rate * factor
         zones.append({**z, "zone_class": zc, "zone_name": z.get("zone_name") or ZONE_NAMES.get(zc, f"Зона {zc}"),
-                      "rate_factor": factor, "rate_kg_ha": round(rate, 1), "total_kg": z["area_ha"] * rate})
+                      "rate_factor": factor, "rate_kg_ha": rate, "total_kg": z["area_ha"] * rate})
     zones.sort(key=lambda z: z["zone_class"])
     total = sum(z["area_ha"] for z in zones)
     stressed = sum(z["area_ha"] for z in zones if z["zone_class"] in (1, 2))
     uniform = total * base_rate
     smart = sum(z["total_kg"] for z in zones)
-    saved = max(0.0, uniform - smart)
+    saved = uniform - smart
     return {
         "total_ha": total, "stressed_ha": stressed,
         "stressed_pct": stressed / total * 100 if total else 0.0,
         "uniform_kg": uniform, "smart_kg": smart, "saved_kg": saved,
-        "saved_pct": saved / uniform * 100 if uniform else 0.0,
+        "saved_pct": saved / uniform * 100 if uniform else None,
         "saved_rub": saved * price, "smart_rub": smart * price, "zones": zones,
     }
+
+
+def prescription_rates_match(metrics: dict, econ: dict | None) -> bool:
+    """Do not offer an old file as a prescription for changed on-screen rates."""
+    if not econ:
+        return False
+    original = {int(z["zone_class"]): z for z in metrics.get("zone_breakdown", [])}
+    base = metrics.get("base_rate_kg_ha", metrics.get("base_rate"))
+    for zone in econ["zones"]:
+        source = original.get(zone["zone_class"], {})
+        rate = source.get("rate_kg_ha", source.get("fertilizer_rate"))
+        if rate is None and base is not None and source.get("rate_factor") is not None:
+            rate = base * source["rate_factor"]
+        if rate is None or not math.isclose(rate, zone["rate_kg_ha"], rel_tol=1e-10, abs_tol=1e-10):
+            return False
+    return True
 
 
 # ----------------------------------------------------------------------------
@@ -551,27 +574,49 @@ with st.sidebar:
     stats = stats_by_date.get(sel_date)
     metrics_path = ds.vra_file(f"metrics_{sel_date}.json")
     metrics = jload(metrics_path) or metrics_from_stats(stats) or {}
+    if metrics.get("quantity_unit", "kg") != "kg":
+        st.error("Выбран файл в литрах. Этот кабинет поддерживает расчёт только в килограммах.")
+        st.stop()
 
     st.divider()
     st.markdown("**Параметры экономики**")
-    base_rate = st.slider("Базовая норма удобрений, кг/га", 50, 300,
-                          int(metrics.get("base_rate_kg_ha") or DEFAULT_BASE_RATE), step=5)
-    price = st.slider("Цена удобрения, ₽/кг", 10, 150, int(metrics.get("price_per_kg") or DEFAULT_PRICE), step=1)
+    file_base = float(metrics.get("base_rate_kg_ha", metrics.get("base_rate", DEFAULT_BASE_RATE)))
+    file_price = float(metrics.get("price_per_kg", metrics.get("price_per_unit", DEFAULT_PRICE)))
+    base_rate = st.slider("Базовая норма удобрений, кг/га", 0.0, max(300.0, file_base), file_base, step=5.0)
+    price = st.slider("Цена удобрения, ₽/кг", 0.0, max(150.0, file_price), file_price, step=1.0)
+    econ = recompute_economics(metrics, base_rate, price) if metrics.get("zone_breakdown") else None
+    downloads_match = prescription_rates_match(metrics, econ)
+    coverage = metrics.get("coverage") or {}
+    if coverage and not coverage.get("is_complete", True):
+        st.warning(f"Неполное покрытие: без класса {coverage['unclassified_area_ha']:.2f} га. "
+                   "В файлах этим участкам норма не назначена; для полного задания требуется решение М2.")
+    filled_area = (stats or {}).get("filled_area_ha") or 0
+    if filled_area > 0:
+        st.warning(f"Восстановлено М2: {filled_area:.2f} га "
+                   f"({(stats or {}).get('filled_percent', 0):.2f}% поля). "
+                   "Облака и тени получили класс ближайшей зоны; это не прямое наблюдение. "
+                   "Эти участки включены в предписание и расчёт экономики.")
+    if file_base == 0:
+        st.caption("При нулевой исходной базе нормы зон фиксированы; ползунок меняет только сплошной вариант сравнения.")
 
     st.divider()
     st.markdown("**Файлы для бортового компьютера**")
+    if metrics_path:
+        st.caption(f"Файлы рассчитаны для нормы сравнения {file_base:g} кг/га "
+                   f"и цены {file_price:g} ₽/кг. Нормы зон заданы в предписании.")
     gj_path = ds.vra_file(f"prescription_{sel_date}.geojson")
     zip_path = ds.vra_file(f"shapefile_{sel_date}.zip")
     if gj_path:
         st.download_button("⬇️ Карта-предписание (.geojson)", gj_path.read_bytes(),
-                           file_name=gj_path.name, mime="application/geo+json")
+                           file_name=gj_path.name, mime="application/geo+json", disabled=not downloads_match)
     if zip_path:
         st.download_button("⬇️ Shapefile для трактора (.zip)", zip_path.read_bytes(),
-                           file_name=zip_path.name, mime="application/zip")
+                           file_name=zip_path.name, mime="application/zip", disabled=not downloads_match)
     if not gj_path and not zip_path:
         st.caption("Файлы-задания появятся, когда Модуль 3 сформирует предписание за эту дату.")
-    elif metrics.get("base_rate_kg_ha") and base_rate != metrics["base_rate_kg_ha"]:
-        st.caption(f"Файлы рассчитаны для нормы {fmt_num(metrics['base_rate_kg_ha'])} кг/га.")
+    elif not downloads_match:
+        st.warning("Нормы на экране отличаются от сохранённых файлов. Верните исходную норму "
+                   "или создайте новое предписание в М3; скачивание текущих файлов отключено.")
     st.caption(f"Данные: `{ds.root}`")
 
 # --- Шапка
@@ -583,13 +628,17 @@ stress_banner(stats)
 econ = recompute_economics(metrics, base_rate, price) if metrics.get("zone_breakdown") else None
 k1, k2, k3, k4 = st.columns(4)
 if econ:
-    k1.metric("Общая площадь поля", f"{fmt_num(econ['total_ha'], 1)} га")
+    k1.metric("Площадь с классификацией", f"{fmt_num(econ['total_ha'], 1)} га")
+    if coverage:
+        st.caption(f"Полный контур: {fmt_num(coverage['reference_field_area_ha'], 2)} га; "
+                   f"без классификации: {fmt_num(coverage['unclassified_area_ha'], 2)} га. "
+                   "Расход и экономия рассчитаны только по классифицированной площади.")
     k2.metric("Зоны стресса", f"{fmt_num(econ['stressed_ha'], 1)} га",
               f"{fmt_num(econ['stressed_pct'], 1)}% поля", delta_color="inverse")
     k3.metric("Сэкономлено удобрений", f"{fmt_num(econ['saved_kg'])} кг",
-              f"{fmt_num(econ['saved_pct'], 1)}% от сплошного внесения")
-    k4.metric("Финансовая экономия", f"{fmt_num(econ['saved_rub'])} ₽",
-              f"затраты {fmt_num(econ['smart_rub'])} ₽ вместо {fmt_num(econ['uniform_kg'] * price)} ₽",
+              f"{fmt_num(econ['saved_pct'], 1)}% от сплошного внесения" if econ['saved_pct'] is not None else "Процент не определён: нулевая база")
+    k4.metric("Финансовая экономия", f"{fmt_num(econ['saved_rub'], 2)} ₽",
+              f"затраты {fmt_num(econ['smart_rub'], 2)} ₽ вместо {fmt_num(econ['uniform_kg'] * price, 2)} ₽",
               delta_color="off")
     if metrics.get("_source") == "m2":
         st.caption("Экономика рассчитана по площадям зон из статистики Модуля 2 "
