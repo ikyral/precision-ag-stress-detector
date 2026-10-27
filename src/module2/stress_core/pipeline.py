@@ -2,7 +2,8 @@
 
 Раскладка выходной папки (``out_dir``; для общего пайплайна команды это ``data/``)::
 
-    out_dir/zones/zones_YYYY_MM_DD.tif              маска зон (uint8: 0 фон, 1..N, 1 = худшее состояние)
+    out_dir/zones/zones_YYYY_MM_DD.tif              маска зон (uint8: 0 вне поля, 1..N, 1 = худшее состояние;
+                                                    облачные пиксели поля — класс ближайшей зоны)
     out_dir/stats/index_stats_YYYY_MM_DD.json       статистика даты + early_stress_alert (читает M4)
     out_dir/indices/NDVI_YYYY_MM_DD.tif ...         одноканальные float32 GeoTIFF по каждому индексу
     out_dir/hidden_stress/hidden_stress_YYYY_MM_DD.tif   маска скрытого стресса (1 / 0 / 255 нет данных)
@@ -27,7 +28,8 @@ from .indices import INDEX_NAMES, compute_indices, valid_mask
 from .stats import hidden_stress_stats, index_stats, zone_stats
 from .zoning import ZoningConfig, ZoningResult, segment_zones
 
-SCHEMA_VERSION = "1.1"
+SCHEMA_VERSION = "1.2"
+FILLED_WARN_FRACTION = 0.2  # выше этой доли поля без данных — предупреждение в index_stats
 DEFAULT_BAND_ORDER = ("R", "RE1", "N", "S1")
 # порядок каналов sample_scene.tif / scene_YYYY_MM_DD.tif от модуля 1 (см. data/README.md)
 SENTINEL2_10_BAND_ORDER = ("B", "G", "R", "RE1", "RE2", "RE3", "N", "N2", "S1", "S2")
@@ -129,13 +131,41 @@ def _auto_scale(arr: np.ndarray, nodata: float | None) -> float:
     return 1.0
 
 
+def field_mask_from_raw(arr: np.ndarray, nodata: float | None) -> np.ndarray | None:
+    """Контур поля по сырому стеку [C, H, W]: вне поля все каналы равны nodata (у M1 — 0).
+
+    Пиксель с NaN (облако, тень) внутри поля полем остаётся. Если nodata не задан или сам NaN, отличить
+    «вне поля» от «облака» нельзя — возвращается None, и контуром считаются пиксели с данными.
+    """
+    if nodata is None or not np.isfinite(nodata):
+        return None
+    return ~np.all(arr == nodata, axis=0)
+
+
+def read_scene_with_field(
+    path: str | Path,
+    band_order: Sequence[str] | None = None,
+    scale: float | None = None,
+) -> tuple[dict[str, np.ndarray], GeoMeta, dict, np.ndarray | None]:
+    """Как read_scene, плюс контур поля (bool [H, W] или None, см. field_mask_from_raw)."""
+    arr, geo = read_geotiff(path)
+    bands, info = _bands_from_array(arr, geo, band_order, scale)
+    return bands, geo, info, field_mask_from_raw(arr, geo.nodata)
+
+
 def read_scene(
     path: str | Path,
     band_order: Sequence[str] | None = None,
     scale: float | None = None,
 ) -> tuple[dict[str, np.ndarray], GeoMeta, dict]:
     """Читает сцену: каналы как отражение 0..1 (NaN — нет данных), геопривязка и сведения о разборе."""
-    arr, geo = read_geotiff(path)
+    bands, geo, info, _ = read_scene_with_field(path, band_order, scale)
+    return bands, geo, info
+
+
+def _bands_from_array(
+    arr: np.ndarray, geo: GeoMeta, band_order: Sequence[str] | None, scale: float | None
+) -> tuple[dict[str, np.ndarray], dict]:
     order = resolve_band_order(arr.shape[0], band_order, geo.band_names)
     factor = float(scale) if scale is not None else _auto_scale(arr, geo.nodata)
     bands = {}
@@ -151,7 +181,7 @@ def read_scene(
         "scale": factor,
         "dtype": str(arr.dtype),
     }
-    return bands, geo, info
+    return bands, info
 
 
 def load_scene(
@@ -186,6 +216,7 @@ class SceneResult:
     zoning: ZoningResult
     early: EarlyStressResult
     record: dict
+    field: np.ndarray | None = None
 
 
 def _mean(a: np.ndarray) -> float | None:
@@ -203,11 +234,14 @@ def analyze_scene(
     prev_anomalies: tuple[np.ndarray, np.ndarray] | None = None,
     backend: str = "numpy",
     prev_indices: tuple[np.ndarray, np.ndarray] | None = None,
+    field: np.ndarray | None = None,
 ) -> SceneResult:
     """Анализ одной даты в памяти (без файлов).
 
     prev_anomalies — (z_ndre, z_ndvi) прошлой даты; prev_indices — (NDRE, NDVI) прошлой даты на той же сетке.
-    Оба нужны только для динамики и необязательны. Падение средних NDRE/NDVI между датами считается только по
+    Оба нужны только для динамики и необязательны.
+    field — контур поля (bool [H, W]); пиксели поля без данных (облако, тень) получают в маске зон класс
+    ближайшей зоны, чтобы площадь зон совпадала с площадью поля на всех датах. None — контур = пиксели с данными. Падение средних NDRE/NDVI между датами считается только по
     пикселям, видимым на обеих датах: иначе облако на одной из дат сдвигает среднее и даёт ложную тревогу.
     """
     zoning_cfg = zoning_cfg or ZoningConfig()
@@ -215,18 +249,33 @@ def analyze_scene(
 
     indices = compute_indices(bands, INDEX_NAMES, backend=backend)
     valid = valid_mask(bands, INDEX_NAMES)
+    if field is None or field.shape != valid.shape:
+        field = valid
+    else:
+        field = np.asarray(field, dtype=bool) | valid
+    gaps = field & ~valid  # внутри поля, но без данных: облако, тень, битые значения
     core = core_mask(valid, early_cfg.edge_buffer_px)  # краевой пояс (смешанные пиксели) не ищем
+    prev_values = None
+    if prev_indices is not None and prev_indices[0].shape == valid.shape:
+        prev_core = core_mask(np.isfinite(prev_indices[0]) & np.isfinite(prev_indices[1]), early_cfg.edge_buffer_px)
+        prev_values = tuple(np.where(prev_core, a, np.nan) for a in prev_indices)
     early = detect_hidden_stress(
         np.where(core, indices["NDRE"], np.nan), np.where(core, indices["NDVI"], np.nan),
-        early_cfg, prev=prev_anomalies,
+        early_cfg, prev=prev_anomalies, prev_values=prev_values,
     )
-    zoning = segment_zones(indices, zoning_cfg)
+    zoning = segment_zones(indices, zoning_cfg, field=field)
 
     area = geo.pixel_area_m2
     h, w = valid.shape
     n_valid = int(valid.sum())
+    n_field = int(field.sum())
+    n_gap = int(gaps.sum())
     idx_stats = {name: index_stats(arr) for name, arr in indices.items()}
     hidden = hidden_stress_stats(early.mask, valid, indices, early.z_ndre, early.z_ndvi, area)
+    # площадь по правилам (могут пересекаться): spatial — одна дата, temporal/decline — динамика
+    hidden["by_rule_ha"] = {
+        k: (round(int(m.sum()) * area / 10_000.0, 4) if area else None) for k, m in (early.by_rule or {}).items()
+    }
 
     pair_prev = pair_cur = None
     common_fraction = None
@@ -250,18 +299,30 @@ def analyze_scene(
         "grid": {"width": w, "height": h, "pixel_area_m2": area, "crs_epsg": geo.epsg},
         "valid_pixels": n_valid,
         "valid_fraction": round(n_valid / (h * w), 6),
-        "field_area_ha": round(n_valid * area / 10_000.0, 4) if area else None,
+        "field_pixels": n_field,
+        "field_area_ha": round(n_field * area / 10_000.0, 4) if area else None,
+        "observed_area_ha": round(n_valid * area / 10_000.0, 4) if area else None,
+        "filled_pixels": n_gap,
+        "filled_area_ha": round(n_gap * area / 10_000.0, 4) if area else None,
+        "filled_percent": round(100.0 * n_gap / n_field, 2) if n_field else 0.0,
         "indices": idx_stats,
         "zones": {
             "n_classes": zoning.n_classes,
             "silhouette": {str(k): round(v, 4) for k, v in zoning.silhouette.items()} or None,
-            "classes": zone_stats(zoning.zones, zoning.labels, indices, area),
+            "filled": "пиксели поля без данных (облако/тень) получают класс ближайшей зоны; "
+                      "их площадь по классам — filled_area_ha",
+            "classes": zone_stats(zoning.zones, zoning.labels, indices, area, filled=gaps),
         },
         "hidden_stress": hidden,
         "early_stress_alert": alert["alert"],
         "early_stress": alert,
     }
-    return SceneResult(date, indices, valid, zoning, early, record)
+    if n_field and n_gap / n_field > FILLED_WARN_FRACTION:
+        record["warnings"] = [
+            f"без данных {100.0 * n_gap / n_field:.1f}% поля: классы зон там восстановлены по соседям, "
+            "доверять им меньше"
+        ]
+    return SceneResult(date, indices, valid, zoning, early, record, field)
 
 
 def build_index_stats_doc(record: dict) -> dict:
@@ -282,9 +343,12 @@ def build_index_stats_doc(record: dict) -> dict:
             else round(record["hidden_stress"]["fraction"] * 100.0, 2)
         ),
         "field_area_ha": record["field_area_ha"],
+        "observed_area_ha": record.get("observed_area_ha"),
+        "filled_area_ha": record.get("filled_area_ha"),
+        "filled_percent": record.get("filled_percent"),
     }
-    for k in ("grid", "valid_pixels", "valid_fraction", "indices", "zones", "hidden_stress", "early_stress",
-              "input", "files"):
+    for k in ("grid", "valid_pixels", "valid_fraction", "field_pixels", "filled_pixels", "warnings",
+              "indices", "zones", "hidden_stress", "early_stress", "input", "files"):
         if k in record:
             doc[k] = record[k]
     return doc
@@ -417,12 +481,12 @@ def run_pipeline(
     prev_date: str | None = None
     for path, date in scenes:
         try:
-            bands, geo, info = read_scene(path, band_order, scale)
+            bands, geo, info, field = read_scene_with_field(path, band_order, scale)
             if use_history and prev_anom is None:
                 hist = _history_from_outputs(out_dir, date, early_cfg, next(iter(bands.values())).shape)
                 if hist is not None:
                     prev_anom, prev_idx, prev_date = hist
-            res = analyze_scene(date, bands, geo, zoning_cfg, early_cfg, prev_anom, backend, prev_idx)
+            res = analyze_scene(date, bands, geo, zoning_cfg, early_cfg, prev_anom, backend, prev_idx, field)
             res.record["early_stress"]["compared_with"] = prev_date if prev_anom is not None else None
             res.record["input"] = info
         except Exception as exc:  # одна плохая сцена не должна ронять весь прогон
@@ -459,8 +523,9 @@ def run_pipeline(
             "indices": list(INDEX_NAMES),
             "zoning": asdict(zoning_cfg),
             "early_stress": asdict(early_cfg),
-            "zone_raster": "uint8; 0 = нет данных, 1 = худшее состояние (низкий NDRE) ... N = норма",
-            "hidden_stress_raster": "uint8; 1 = скрытый стресс, 0 = нет, 255 = нет данных",
+            "zone_raster": "uint8; 0 = вне поля, 1 = худшее состояние (низкий NDRE) ... N = норма; "
+                           "облачные пиксели поля заполнены классом ближайшей зоны",
+            "hidden_stress_raster": "uint8; 1 = скрытый стресс, 0 = нет, 255 = нет данных (вне поля или облако)",
         },
         "warnings": warnings,
         "dates": dates,
@@ -514,3 +579,68 @@ def analyze_field(
     if "error" in record:
         raise RuntimeError(f"{scene_tif}: {record['error']}")
     return record
+
+
+def processed_dates(out_dir: str | Path) -> list[str]:
+    """Даты, для которых в out_dir уже есть stats/index_stats_*.json и маска zones/zones_*.tif."""
+    out_dir = Path(out_dir)
+    done = []
+    for p in (out_dir / "stats").glob("index_stats_*.json"):
+        try:
+            d = parse_date(p.stem[len("index_stats_"):])
+        except ValueError:
+            continue
+        if (out_dir / "zones" / f"zones_{d.replace('-', '_')}.tif").exists():
+            done.append(d)
+    return sorted(done)
+
+
+def process_new_scenes(
+    scenes: str | Path | Sequence[str | Path] = "data/scenes",
+    out_dir: str | Path | None = None,
+    band_order: Sequence[str] | None = None,
+    scale: float | None = None,
+    zoning_cfg: ZoningConfig | None = None,
+    early_cfg: EarlyStressConfig | None = None,
+    backend: str = "numpy",
+) -> dict:
+    """Обработать только новые сцены (точка входа для main_pipeline.py, КТ3).
+
+    Сцены, для которых в out_dir уже есть zones и stats, пропускаются; динамика первой новой даты считается
+    от ближайшей более ранней уже обработанной даты. Повторный вызов без новых снимков ничего не меняет.
+    out_dir по умолчанию: для папки data/scenes это data/.
+    Возвращает {"processed": [...], "skipped": [...], "errors": {...}, "warnings": [...]}.
+    """
+    inputs = [scenes] if isinstance(scenes, (str, Path)) else list(scenes)
+    if out_dir is None:
+        first = Path(inputs[0])
+        out_dir = first.resolve().parent if first.is_dir() and first.name == "scenes" else default_out_dir(first)
+    out_dir = Path(out_dir)
+    found, warnings = collect_scenes(inputs)
+    done = set(processed_dates(out_dir))
+    new = [(p, d) for p, d in found if d not in done]
+    skipped = sorted(d for _, d in found if d in done)
+    if done and new:
+        latest = max(done)
+        late = [d for _, d in new if d < latest]
+        if late:
+            warnings.append(
+                f"даты {', '.join(late)} раньше уже обработанной {latest}: динамика более поздних дат посчитана "
+                "без них — для точного ряда перезапустите всю серию (stress_core run)"
+            )
+    for msg in warnings:
+        print(f"предупреждение: {msg}", file=sys.stderr)
+    result = {"processed": [], "skipped": skipped, "errors": {}, "warnings": warnings, "out_dir": str(out_dir)}
+    if not new:
+        return result
+    summary = run_pipeline(
+        [p for p, _ in new], out_dir, band_order=band_order, scale=scale, zoning_cfg=zoning_cfg,
+        early_cfg=early_cfg, backend=backend, use_history=True,
+    )
+    for _, d in new:
+        rec = summary["dates"].get(d, {})
+        if "error" in rec:
+            result["errors"][d] = rec["error"]
+        else:
+            result["processed"].append(d)
+    return result

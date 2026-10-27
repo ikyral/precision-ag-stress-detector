@@ -126,7 +126,7 @@ def _merge_small(cls: np.ndarray, min_px: int, max_rounds: int = 5) -> np.ndarra
 
 
 def _fill_edge(cls: np.ndarray, full_valid: np.ndarray) -> np.ndarray:
-    """Валидные пиксели без класса (краевой пояс) получают класс ближайшего классифицированного пикселя."""
+    """Пиксели поля без класса (краевой пояс, облачные дыры) получают класс ближайшего размеченного пикселя."""
     gap = full_valid & (cls == 0)
     if not gap.any() or not (cls > 0).any():
         return cls
@@ -137,11 +137,17 @@ def _fill_edge(cls: np.ndarray, full_valid: np.ndarray) -> np.ndarray:
 
 
 def segment_zones(
-    indices: dict[str, np.ndarray], cfg: ZoningConfig | None = None
+    indices: dict[str, np.ndarray], cfg: ZoningConfig | None = None, field: np.ndarray | None = None
 ) -> ZoningResult:
-    """Строит растр зон управления по набору индексов (2D float, NaN = нет данных)."""
+    """Строит растр зон управления по набору индексов (2D float, NaN = нет данных).
+
+    field — контур поля (bool [H, W]). Пиксели поля без данных (облако, тень) в кластеризации не участвуют
+    и получают класс ближайшей зоны, так что маска зон покрывает весь контур на любой дате.
+    Без field размечаются только пиксели с данными.
+    """
     cfg = cfg or ZoningConfig()
     full_valid = np.all([np.isfinite(indices[name]) for name in cfg.features], axis=0)
+    fill_to = full_valid if field is None else (np.asarray(field, dtype=bool) | full_valid)
     core = core_mask(full_valid, cfg.edge_buffer_px)  # без краевого пояса из смешанных пикселей
     smoothed = [
         smooth_nan(np.where(core, indices[name], np.nan), cfg.feature_sigma_px) for name in cfg.features
@@ -183,7 +189,7 @@ def segment_zones(
         for _ in range(cfg.majority_iters):
             cls = _majority(cls, k, cfg.majority_size)
     cls = _merge_small(cls, cfg.min_zone_px)
-    cls = _fill_edge(cls, full_valid)  # краевой пояс получает класс ближайшей зоны: контур поля не меняется
+    cls = _fill_edge(cls, fill_to)  # краевой пояс и облачные дыры — класс ближайшей зоны: контур не меняется
 
     # нумерация подряд 1..N (классы могли исчезнуть при сглаживании)
     present = np.unique(cls[cls > 0])
