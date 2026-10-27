@@ -167,6 +167,51 @@ class EarlyStressTest(unittest.TestCase):
         self.assertGreater(both.mask[inner].mean(), 0.8)
         self.assertEqual(int(both.mask[~truth].sum()), 0)
 
+    def _decline_pair(self, field_change=(-0.05, -0.03), patch_change=(-0.11, -0.04), seed=5):
+        """Две даты: всё поле меняется на field_change (NDRE, NDVI в долях), участок 20x20 — на patch_change."""
+        rng = np.random.default_rng(seed)
+        shape = (80, 80)
+        # неоднородное поле, как реальное: плавные пятна (почва, густота) + шум датчика
+        base = ndi.gaussian_filter(rng.standard_normal(shape), 6)
+        base /= base.std()
+        ndre0 = 0.60 + 0.04 * base + 0.005 * rng.standard_normal(shape)
+        ndvi0 = 0.82 + 0.03 * base + 0.005 * rng.standard_normal(shape)
+        k_re = np.full(shape, 1 + field_change[0])
+        k_vi = np.full(shape, 1 + field_change[1])
+        k_re[30:50, 30:50] = 1 + patch_change[0]
+        k_vi[30:50, 30:50] = 1 + patch_change[1]
+        noise = lambda: 1 + 0.003 * rng.standard_normal(shape)  # noqa: E731
+        return (ndre0, ndvi0), (ndre0 * k_re * noise(), ndvi0 * k_vi * noise())
+
+    def test_decline_rule_catches_gradual_patch_that_z_rules_miss(self):
+        """Как на юге поля в августе 2026: участок теряет NDRE быстрее поля и быстрее NDVI."""
+        (re0, vi0), (re1, vi1) = self._decline_pair()
+        cfg = EarlyStressConfig()
+        first = detect_hidden_stress(re0, vi0, cfg)
+        no_decline = detect_hidden_stress(re1, vi1, EarlyStressConfig(use_decline=False),
+                                          prev=(first.z_ndre, first.z_ndvi))
+        res = detect_hidden_stress(re1, vi1, cfg, prev=(first.z_ndre, first.z_ndvi), prev_values=(re0, vi0))
+        inner = np.zeros(re0.shape, bool)
+        inner[32:48, 32:48] = True
+        self.assertLess(no_decline.mask[inner].mean(), 0.2)
+        self.assertGreater(res.by_rule["decline"][inner].mean(), 0.9)
+        outer = np.ones(re0.shape, bool)
+        outer[27:53, 27:53] = False
+        self.assertEqual(int(res.mask[outer].sum()), 0)
+
+    def test_decline_rule_ignores_uniform_seasonal_drop_and_growth(self):
+        for field, patch in (((-0.10, -0.04), (-0.10, -0.04)),   # всё поле созревает одинаково
+                             ((0.12, 0.02), (0.07, 0.02))):      # фаза роста: участок растёт медленнее
+            (re0, vi0), (re1, vi1) = self._decline_pair(field, patch)
+            res = detect_hidden_stress(re1, vi1, EarlyStressConfig(use_temporal=False), prev_values=(re0, vi0))
+            self.assertEqual(int(res.by_rule["decline"].sum()), 0, (field, patch))
+
+    def test_decline_rule_needs_ndre_to_lead_ndvi(self):
+        """NDVI падает так же быстро, как NDRE — это уже видимое угнетение, не скрытое."""
+        (re0, vi0), (re1, vi1) = self._decline_pair(patch_change=(-0.12, -0.12))
+        res = detect_hidden_stress(re1, vi1, EarlyStressConfig(use_temporal=False), prev_values=(re0, vi0))
+        self.assertEqual(int(res.by_rule["decline"].sum()), 0)
+
     def test_homogeneous_healthy_field_has_no_detections(self):
         rng = np.random.default_rng(3)
         ndre = 0.5 + 0.005 * rng.standard_normal((60, 60))
@@ -269,7 +314,9 @@ class PipelineTest(unittest.TestCase):
             self.assertEqual(set(rec["indices"]), {"NDVI", "NDRE", "MSAVI2", "NDMI"})
             self.assertEqual(set(rec["indices"]["NDVI"]), {"n", "mean", "std", "min", "max", "p5", "p25", "p50", "p75", "p95"})
             self.assertAlmostEqual(sum(c["fraction"] for c in rec["zones"]["classes"]), 1.0, places=3)
-            self.assertEqual(sum(c["pixels"] for c in rec["zones"]["classes"]), rec["valid_pixels"])
+            # маска зон покрывает весь контур поля, включая заполненные облачные пиксели
+            self.assertEqual(sum(c["pixels"] for c in rec["zones"]["classes"]), rec["field_pixels"])
+            self.assertEqual(rec["valid_pixels"] + rec["filled_pixels"], rec["field_pixels"])
             for c in rec["zones"]["classes"]:
                 self.assertAlmostEqual(c["area_ha"], c["pixels"] * 100 / 10_000, places=3)
 
@@ -292,11 +339,23 @@ class PipelineTest(unittest.TestCase):
         self.assertTrue((hidden[0, 100:112, 120:150] == 255).all())  # под облаком
         self.assertEqual(int((hidden[0] == 1).sum()), rec["hidden_stress"]["pixels"])
 
-    def test_hidden_focus_reported_on_second_date_only(self):
-        pix = [self.summary["dates"][d]["hidden_stress"]["pixels"] for d in sorted(self.summary["dates"])]
-        self.assertGreater(pix[1], 500)
-        self.assertLess(pix[0], 100)
-        self.assertEqual(pix[2], 0)
+    def test_hidden_focus_found_on_second_date_by_spatial_rule(self):
+        recs = [self.summary["dates"][d]["hidden_stress"] for d in sorted(self.summary["dates"])]
+        self.assertGreater(recs[1]["pixels"], 500)
+        self.assertLess(recs[0]["pixels"], 100)
+        # на третьей дате NDVI в очаге уже упал: по одной дате он больше не «скрытый»
+        self.assertLess(recs[2]["by_rule_ha"]["spatial"], 0.1 * recs[1]["area_ha"])
+
+    def test_decline_on_third_date_only_inside_worsening_areas(self):
+        """На 3-й дате очаг и умеренная зона ухудшаются (NDRE падает быстрее NDVI) — правило decline;
+        здоровая часть поля и неизменный острый очаг не отмечаются."""
+        sc = make_scenes()[2]
+        hidden, _ = read_geotiff(self.out / "hidden_stress" / "hidden_stress_2026_07_05.tif")
+        flagged = hidden[0] == 1
+        worsening = (sc.truth["hidden"] > 0.1) | (sc.truth["moderate"] > 0.1)
+        self.assertGreater(int(flagged.sum()), 500)
+        self.assertGreater(flagged[worsening].sum() / flagged.sum(), 0.98)
+        self.assertEqual(int(flagged[sc.truth["acute"] > 0.5].sum()), 0)
 
     def test_each_index_is_single_band_float_with_georeference(self):
         _, src_geo = read_geotiff(self.inputs[0])
@@ -317,7 +376,8 @@ class PipelineTest(unittest.TestCase):
                 self.assertIsInstance(doc[key], float, key)
             self.assertIsInstance(doc["early_stress_alert"], bool)
             self.assertEqual(doc["date"], d.replace("_", "-"))
-            self.assertAlmostEqual(doc["field_area_ha"], doc["valid_pixels"] * 100 / 10_000, places=3)
+            self.assertAlmostEqual(doc["field_area_ha"], doc["field_pixels"] * 100 / 10_000, places=3)
+            self.assertAlmostEqual(doc["observed_area_ha"] + doc["filled_area_ha"], doc["field_area_ha"], places=3)
 
     def test_means_in_stats_match_summary(self):
         doc = json.loads((self.out / "stats" / "index_stats_2026_06_20.json").read_text(encoding="utf-8"))
@@ -325,9 +385,9 @@ class PipelineTest(unittest.TestCase):
         self.assertEqual(doc["mean_ndre"], rec["indices"]["NDRE"]["mean"])
         self.assertEqual(doc["mean_msavi"], rec["indices"]["MSAVI2"]["mean"])
 
-    def test_alert_fires_only_when_hidden_focus_present(self):
+    def test_alert_fires_when_hidden_focus_present_or_worsening(self):
         alerts = {d: self.summary["dates"][d]["early_stress_alert"] for d in sorted(self.summary["dates"])}
-        self.assertEqual(alerts, {"2026-06-05": False, "2026-06-20": True, "2026-07-05": False})
+        self.assertEqual(alerts, {"2026-06-05": False, "2026-06-20": True, "2026-07-05": True})
         self.assertIn("hidden_area", self.summary["dates"]["2026-06-20"]["early_stress"]["reasons"])
 
     def test_bad_scene_does_not_stop_the_run(self):
@@ -340,6 +400,89 @@ class PipelineTest(unittest.TestCase):
         self.assertIn("error", s["dates"]["2026-06-10"])
         self.assertNotIn("error", s["dates"]["2026-06-20"])
         self.assertEqual(len(good), 3)
+
+
+class CloudFillTest(unittest.TestCase):
+    """Облачные дыры внутри поля: класс ближайшей зоны, площадь поля одинакова на всех датах (контракт с M3)."""
+
+    @classmethod
+    def setUpClass(cls):
+        cls.tmp = tempfile.TemporaryDirectory()
+        root = Path(cls.tmp.name)
+        cls.inputs = write_demo_scenes(root / "in")
+        cls.out = root / "out"
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore")
+            cls.summary = run_pipeline(cls.inputs, cls.out)
+
+    @classmethod
+    def tearDownClass(cls):
+        cls.tmp.cleanup()
+
+    def test_field_area_is_constant_across_dates(self):
+        areas = set()
+        for d in self.summary["dates"]:
+            zones, _ = read_geotiff(self.out / "zones" / f"zones_{d.replace('-', '_')}.tif")
+            areas.add(int((zones[0] > 0).sum()))
+            self.assertAlmostEqual(self.summary["dates"][d]["field_area_ha"], 192.0, places=3)
+        self.assertEqual(areas, {120 * 160})
+
+    def test_cloud_pixels_get_zone_class_and_are_reported(self):
+        rec = self.summary["dates"]["2026-07-05"]
+        zones, _ = read_geotiff(self.out / rec["files"]["zones"])
+        self.assertTrue((zones[0, 100:112, 120:150] > 0).all())
+        self.assertEqual(rec["filled_pixels"], 12 * 30)
+        self.assertAlmostEqual(rec["filled_area_ha"], 3.6, places=3)
+        self.assertAlmostEqual(rec["filled_percent"], 100 * 360 / 19200, places=2)
+        self.assertEqual(sum(c["filled_pixels"] for c in rec["zones"]["classes"]), 360)
+        self.assertNotIn("warnings", rec)  # 1,9 % поля — ниже порога предупреждения
+        for d in ("2026-06-05", "2026-06-20"):
+            self.assertEqual(self.summary["dates"][d]["filled_pixels"], 0)
+
+    def test_indices_stay_nodata_under_cloud(self):
+        """Значения индексов под облаком не выдумываются: NaN в растрах, в средние не входят."""
+        ndvi, _ = read_geotiff(self.out / "indices" / "NDVI_2026_07_05.tif")
+        self.assertTrue(np.isnan(ndvi[0, 100:112, 120:150]).all())
+        rec = self.summary["dates"]["2026-07-05"]
+        self.assertEqual(rec["indices"]["NDVI"]["n"], rec["valid_pixels"])
+
+    def test_outside_field_stays_zero_and_hole_is_filled(self):
+        """Круглое поле: 0 вне круга (вне поля), NaN-дыра внутри (облако) — как в сценах M1."""
+        sc = make_scenes()[0]
+        h, w = sc.bands["R"].shape
+        yy, xx = np.mgrid[:h, :w]
+        inside = (yy - h / 2) ** 2 + (xx - w / 2) ** 2 < 55 ** 2
+        hole = (yy - 60) ** 2 + (xx - 95) ** 2 < 8 ** 2
+        stack = np.stack([sc.bands[b] for b in ("R", "RE1", "N", "S1")]).astype(np.float32)
+        stack = np.where(inside, stack, 0).astype(np.float32)
+        stack[:, hole] = np.nan
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "scene_2026_06_05.tif"
+            write_geotiff(path, stack, sc.geo, nodata=0)
+            summary = run_pipeline([path], Path(tmp) / "out", band_order=("R", "RE1", "N", "S1"))
+            zones, _ = read_geotiff(Path(tmp) / "out" / "zones" / "zones_2026_06_05.tif")
+        rec = summary["dates"]["2026-06-05"]
+        self.assertEqual(rec["field_pixels"], int(inside.sum()))
+        self.assertEqual(rec["filled_pixels"], int(hole.sum()))
+        self.assertTrue((zones[0][~inside] == 0).all())
+        self.assertTrue((zones[0][inside] > 0).all())
+
+    def test_large_gap_gives_warning(self):
+        sc = make_scenes()[0]
+        bands = {b: v.copy() for b, v in sc.bands.items()}
+        for v in bands.values():
+            v[:, :60] = np.nan  # 37,5 % поля под облаком
+        field = np.ones(bands["R"].shape, dtype=bool)
+        res = analyze_scene("2026-06-05", bands, sc.geo, field=field)
+        self.assertTrue((res.zoning.zones > 0).all())
+        self.assertAlmostEqual(res.record["filled_percent"], 37.5, places=2)
+        self.assertIn("warnings", res.record)
+
+    def test_without_field_only_observed_pixels_are_zoned(self):
+        sc = make_scenes()[2]  # дата с облаком
+        res = analyze_scene("2026-07-05", sc.bands, sc.geo)
+        self.assertTrue((res.zoning.zones[100:112, 120:150] == 0).all())
+        self.assertEqual(res.record["filled_pixels"], 0)
 
 
 class EdgePixelsTest(unittest.TestCase):
@@ -731,3 +874,98 @@ class OrderingAndEntryPointsTest(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class NewScenesAndContractTest(unittest.TestCase):
+    """КТ3: обработка только новых дат и проверка выходов на контракт с M3/M4."""
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        root = Path(self.tmp.name)
+        self.scenes = root / "data" / "scenes"
+        self.data = root / "data"
+        self.paths = write_demo_scenes(self.scenes)
+
+    def tearDown(self):
+        self.tmp.cleanup()
+
+    def _hide(self, keep):
+        hidden = self.scenes.parent / "later"
+        hidden.mkdir(exist_ok=True)
+        for p in self.paths:
+            if p.name not in keep:
+                p.rename(hidden / p.name)
+        return hidden
+
+    def test_only_new_dates_are_processed_and_default_out_is_data(self):
+        from stress_core import process_new_scenes
+
+        later = self._hide({self.paths[0].name, self.paths[1].name})
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore")
+            first = process_new_scenes(self.scenes)
+        self.assertEqual(first["processed"], ["2026-06-05", "2026-06-20"])
+        self.assertEqual(Path(first["out_dir"]).resolve(), self.data.resolve())
+        stamp_before = (self.data / "zones" / "zones_2026_06_05.tif").stat().st_mtime_ns
+        (later / self.paths[2].name).rename(self.paths[2])
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore")
+            second = process_new_scenes(self.scenes)
+        self.assertEqual(second["processed"], ["2026-07-05"])
+        self.assertEqual(second["skipped"], ["2026-06-05", "2026-06-20"])
+        self.assertEqual((self.data / "zones" / "zones_2026_06_05.tif").stat().st_mtime_ns, stamp_before)
+        doc = json.loads((self.data / "stats" / "index_stats_2026_07_05.json").read_text(encoding="utf-8"))
+        self.assertEqual(doc["early_stress"]["compared_with"], "2026-06-20")
+        third = process_new_scenes(self.scenes)  # новых снимков нет — ничего не меняется
+        self.assertEqual(third["processed"], [])
+
+    def test_late_scene_gives_warning(self):
+        from stress_core import process_new_scenes
+
+        later = self._hide({self.paths[0].name, self.paths[2].name})
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore")
+            process_new_scenes(self.scenes)
+            (later / self.paths[1].name).rename(self.paths[1])
+            res = process_new_scenes(self.scenes)
+        self.assertEqual(res["processed"], ["2026-06-20"])
+        self.assertTrue(any("2026-07-05" in w for w in res["warnings"]))
+
+    def test_contract_check_passes_and_catches_problems(self):
+        from stress_core.contract import check_outputs
+
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore")
+            run_pipeline(self.paths, self.data)
+        rep = check_outputs(self.data)
+        self.assertTrue(rep["ok"], rep["errors"])
+        self.assertEqual(rep["area_spread_ha"], 0.0)
+        # маска с классом 4 и «дырой» — M3 такое не примет
+        zpath = self.data / "zones" / "zones_2026_06_20.tif"
+        zones, geo = read_geotiff(zpath)
+        bad = zones[0].copy()
+        bad[:5, :5] = 4
+        bad[50:60, 50:60] = 0
+        write_geotiff(zpath, bad, geo, nodata=0)
+        rep = check_outputs(self.data)
+        self.assertFalse(rep["ok"])
+        self.assertTrue(any("вне 0..3" in e for e in rep["errors"]))
+        self.assertTrue(any("площадь поля" in e for e in rep["errors"]))
+
+    def test_cli_update_check_and_season(self):
+        from stress_core.__main__ import main
+
+        try:
+            import matplotlib  # noqa: F401
+        except ImportError:
+            self.skipTest("нет matplotlib")
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore")
+            self.assertEqual(main(["update", str(self.scenes), "-o", str(self.data)]), 0)
+            self.assertEqual(main(["check", str(self.data)]), 0)
+            self.assertEqual(main(["season", str(self.data)]), 0)
+        rep = json.loads((self.data / "season" / "season_report.json").read_text(encoding="utf-8"))
+        self.assertEqual(rep["dates"], ["2026-06-05", "2026-06-20", "2026-07-05"])
+        self.assertEqual(rep["focus"]["date"], "2026-06-20")
+        for name in ("season_zones.png", "season_indices.png", "season_dynamics.png"):
+            self.assertGreater((self.data / "season" / name).stat().st_size, 10_000, name)

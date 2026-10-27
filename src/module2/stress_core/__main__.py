@@ -2,6 +2,9 @@
 
   python -m stress_core run <сцены> -o <папка>      серия сцен -> зоны, статистика, индексы
   python -m stress_core indices <scene.tif> -o <папка>   только NDVI.tif, NDRE.tif, MSAVI.tif, NDMI.tif
+  python -m stress_core update <data/scenes> -o <data>   только новые даты (для main_pipeline, КТ3)
+  python -m stress_core check <data>                проверка zones/stats/indices на контракт с M3 и M4
+  python -m stress_core season <data>               маски и графики за сезон в <data>/season (КТ4)
   python -m stress_core demo -o <папка>             синтетическое поле и его обработка
 """
 from __future__ import annotations
@@ -12,7 +15,7 @@ from pathlib import Path
 
 from .early_stress import EarlyStressConfig
 from .indices import INDEX_NAMES, compute_indices
-from .pipeline import SENTINEL2_10_BAND_ORDER, load_scene, run_pipeline, save_index_rasters
+from .pipeline import SENTINEL2_10_BAND_ORDER, load_scene, process_new_scenes, run_pipeline, save_index_rasters
 from .synthetic import write_demo_scenes
 from .zoning import ZoningConfig
 
@@ -61,6 +64,20 @@ def main(argv=None) -> int:
     idx.add_argument("scene", type=Path)
     _add_common(idx)
 
+    upd = sub.add_parser("update", help="обработать только новые сцены (уже обработанные даты пропускаются)")
+    upd.add_argument("inputs", nargs="+", help="папка data/scenes или файлы сцен")
+    upd.add_argument("--classes", type=_classes, default=3)
+    _add_common(upd)
+
+    chk = sub.add_parser("check", help="проверить результаты на контракт с M3 и M4")
+    chk.add_argument("data", type=Path, help="папка с zones/, stats/, indices/ (обычно data)")
+
+    sea = sub.add_parser("season", help="маски и графики за сезон -> <data>/season")
+    sea.add_argument("data", type=Path, help="папка с результатами run (обычно data)")
+    sea.add_argument("--focus-date", help="дата очага YYYY-MM-DD (по умолчанию — дата с наибольшим скрытым стрессом)")
+    sea.add_argument("--visible-drop", type=float, default=0.10,
+                     help="насколько NDVI очага ниже поля, чтобы считать угнетение видимым (доля, 0.10)")
+
     demo = sub.add_parser("demo", help="сгенерировать синтетическое поле и обработать его")
     demo.add_argument("--classes", type=_classes, default=3)
     _add_common(demo)
@@ -73,7 +90,38 @@ def main(argv=None) -> int:
         print("сохранено:", ", ".join(files.values()), "->", args.out)
         return 0
 
+    if args.cmd == "check":
+        from .contract import check_outputs
+
+        rep = check_outputs(args.data)
+        print(f"дат: {len(rep['dates'])}; площадь поля в масках: "
+              + (", ".join(f"{d} {a}" for d, a in rep["area_ha"].items()) or "—"))
+        for err in rep["errors"]:
+            print(f"  ОШИБКА: {err}", file=sys.stderr)
+        print("контракт M2 -> M3/M4: OK" if rep["ok"] else "контракт M2 -> M3/M4: есть ошибки")
+        return 0 if rep["ok"] else 1
+
+    if args.cmd == "season":
+        from .season import write_season_report
+
+        rep = write_season_report(args.data, args.focus_date, args.visible_drop)
+        f = rep["focus"]
+        print(f"тревоги: {', '.join(rep['alert_dates']) or 'нет'}")
+        print(f"очаг {f['date']} ({f['area_ha']} га): найден {f['first_flagged']}, виден по NDVI "
+              f"{f['visible_ndvi_date'] or '—'}, опережение {f['lead_days'] if f['lead_days'] is not None else '—'} дн.")
+        print("файлы:", ", ".join(rep["files"].values()), "->", args.data)
+        return 0
+
     zcfg = ZoningConfig(n_classes=args.classes)
+    if args.cmd == "update":
+        res = process_new_scenes(args.inputs, args.out, band_order=args.bands, scale=args.scale,
+                                 zoning_cfg=zcfg, early_cfg=EarlyStressConfig(), backend=args.backend)
+        print(f"новых дат: {len(res['processed'])} ({', '.join(res['processed']) or '—'}); "
+              f"уже были: {len(res['skipped'])}; результаты: {res['out_dir']}")
+        for d, err in res["errors"].items():
+            print(f"  ОШИБКА {d}: {err}", file=sys.stderr)
+        return 1 if res["errors"] else 0
+
     if args.cmd == "run":
         inputs, date, save_idx, history = args.inputs, args.date, not args.no_indices, not args.no_history
     else:

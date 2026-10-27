@@ -90,13 +90,14 @@ def make_scenes(seed: int = 0, shape=(120, 160), epsg: int = 32637) -> list[Synt
 
 
 def write_demo_scenes(out_dir: str | Path, seed: int = 0) -> list[Path]:
-    """Пишет сцены как 4-канальные uint16 GeoTIFF (R, RE1, N, S1; DN = отражение*10000)."""
+    """Пишет сцены как 4-канальные float32 GeoTIFF (R, RE1, N, S1; отражение 0..1) в формате M1:
+    0 во всех каналах — вне поля, NaN — облако внутри поля."""
     out_dir = Path(out_dir)
     paths = []
     for sc in make_scenes(seed):
-        stack = np.stack([sc.bands[b] for b in ("R", "RE1", "N", "S1")])
-        dn = np.where(np.isfinite(stack), np.clip(np.round(stack * 10_000), 1, 65535), 0).astype(np.uint16)
+        stack = np.stack([sc.bands[b] for b in ("R", "RE1", "N", "S1")]).astype(np.float32)
+        stack = np.where(np.isfinite(stack), np.clip(stack, 1e-4, None), np.nan).astype(np.float32)
         path = out_dir / f"scene_{sc.date}.tif"
-        write_geotiff(path, dn, sc.geo, nodata=0)
+        write_geotiff(path, stack, sc.geo, nodata=0)
         paths.append(path)
     return paths
