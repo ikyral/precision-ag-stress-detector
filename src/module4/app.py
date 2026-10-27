@@ -315,10 +315,20 @@ def metrics_from_stats(stats: dict | None) -> dict | None:
     }
 
 
+def metrics_base_rate(metrics: dict) -> float | None:
+    """Базовая норма, с которой рассчитан файл: base_rate_kg_ha (мок-данные) или base_rate (M3)."""
+    return metrics.get("base_rate_kg_ha") or metrics.get("base_rate")
+
+
+def metrics_price(metrics: dict) -> float | None:
+    """Цена удобрения из файла: price_per_kg (мок-данные) или price_per_unit (M3)."""
+    return metrics.get("price_per_kg") or metrics.get("price_per_unit")
+
+
 def recompute_economics(metrics: dict, base_rate: float, price: float) -> dict:
     """Норма зоны = base_rate * rate_factor; rate_factor берётся из файла
-    или выводится как rate_kg_ha / base_rate_kg_ha (с которыми файл был рассчитан)."""
-    file_base = metrics.get("base_rate_kg_ha") or 0.0
+    или выводится как rate_kg_ha / базовая норма файла (с которыми файл был рассчитан)."""
+    file_base = metrics_base_rate(metrics) or 0.0
     zones = []
     for z in metrics.get("zone_breakdown", []):
         zc = int(z["zone_class"])
@@ -555,8 +565,8 @@ with st.sidebar:
     st.divider()
     st.markdown("**Параметры экономики**")
     base_rate = st.slider("Базовая норма удобрений, кг/га", 50, 300,
-                          int(metrics.get("base_rate_kg_ha") or DEFAULT_BASE_RATE), step=5)
-    price = st.slider("Цена удобрения, ₽/кг", 10, 150, int(metrics.get("price_per_kg") or DEFAULT_PRICE), step=1)
+                          int(metrics_base_rate(metrics) or DEFAULT_BASE_RATE), step=5)
+    price = st.slider("Цена удобрения, ₽/кг", 10, 150, int(metrics_price(metrics) or DEFAULT_PRICE), step=1)
 
     st.divider()
     st.markdown("**Файлы для бортового компьютера**")
@@ -570,8 +580,8 @@ with st.sidebar:
                            file_name=zip_path.name, mime="application/zip")
     if not gj_path and not zip_path:
         st.caption("Файлы-задания появятся, когда Модуль 3 сформирует предписание за эту дату.")
-    elif metrics.get("base_rate_kg_ha") and base_rate != metrics["base_rate_kg_ha"]:
-        st.caption(f"Файлы рассчитаны для нормы {fmt_num(metrics['base_rate_kg_ha'])} кг/га.")
+    elif metrics_base_rate(metrics) and base_rate != metrics_base_rate(metrics):
+        st.caption(f"Файлы рассчитаны для нормы {fmt_num(metrics_base_rate(metrics))} кг/га.")
     st.caption(f"Данные: `{ds.root}`")
 
 # --- Шапка
