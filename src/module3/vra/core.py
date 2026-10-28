@@ -22,6 +22,7 @@ from shapely.ops import transform as transform_geometry, unary_union
 from shapely.strtree import STRtree
 
 from .economics import ZONE_NAMES, _nonnegative, calculate_economics, validate_parameters
+from .coverage import coverage_report
 
 
 def normalize_date(date_str: str) -> str:
@@ -204,12 +205,14 @@ def generate_prescription(
     *,
     min_polygon_area_ha: float = 0.05,
     unit: str = "kg",
+    reference_mask_path: str | None = None,
 ) -> tuple[str, str, str]:
     """Generate GeoJSON, zipped ESRI Shapefile, and a JSON economic report.
 
     Norms are illustrative project defaults, not agronomic recommendations.
     With unit='l', legacy *_kg arguments are interpreted as liters/ha and
-    RUB/liter. Missing/background pixels are excluded from the observed field.
+    RUB/liter. Missing/background pixels in the input zones are excluded.
+    Classes filled upstream by M2 are included; classified does not mean observed.
     Returns paths to (GeoJSON, Shapefile ZIP, metrics JSON).
     """
     date = normalize_date(date_str)
@@ -292,6 +295,13 @@ def generate_prescription(
         "source_stressed_area_percent": (source_areas[1] + source_areas[2]) / source_total * 100,
     }
     report["warnings"] = []
+    if reference_mask_path is not None:
+        report["coverage"] = coverage_report(zones_tif_path, reference_mask_path, project)
+        if not report["coverage"]["is_complete"]:
+            report["warnings"].append(
+                "Incomplete reference-field coverage: no rate is assigned to unclassified pixels; "
+                "economics applies only to classified area."
+            )
     if retained_small:
         report["warnings"].append(
             f"{retained_small} isolated polygon(s) below the area threshold were retained to preserve coverage."
@@ -302,7 +312,8 @@ def generate_prescription(
         )
     report["warnings"].append(
         "Areas cover valid classified pixels only. Background and nodata are excluded; "
-        "a fixed field boundary is required to distinguish outside-field pixels from missing observations."
+        "upstream-filled classes are included and are not direct observations. "
+        "See M2 index_stats for observed_area_ha and filled_area_ha."
     )
     out = Path(output_dir).resolve()
     out.mkdir(parents=True, exist_ok=True)

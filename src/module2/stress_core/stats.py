@@ -49,18 +49,23 @@ def zone_stats(
     labels: list[str],
     indices: Mapping[str, np.ndarray],
     pixel_area_m2: float | None,
+    filled: np.ndarray | None = None,
 ) -> list[dict]:
+    """Статистика по классам; filled — пиксели, класс которых восстановлен по соседям (нет данных)."""
     total = int((zones > 0).sum())
     rows = []
     for i, label in enumerate(labels, start=1):
         sel = zones == i
         n = int(sel.sum())
+        n_fill = int((sel & filled).sum()) if filled is not None else 0
         rows.append({
             "class": i,
             "label": label,
             "pixels": n,
             "fraction": _f(n / total) if total else None,
             "area_ha": _area_ha(n, pixel_area_m2),
+            "filled_pixels": n_fill,
+            "filled_area_ha": _area_ha(n_fill, pixel_area_m2),
             "mean": _means(indices, sel),
         })
     return rows

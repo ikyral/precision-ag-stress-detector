@@ -277,5 +277,32 @@ class TestSelection(unittest.TestCase):
                          ["2026-W31", "2026-W32", "2026-W33"])
 
 
+class TestManifest(unittest.TestCase):
+    def test_rerun_keeps_file_when_only_time_changed(self):
+        from s2fetch import manifest
+
+        entry = {"2026-08-07": {"date": "2026-08-07", "selected": True, "nan_percent": 0.5}}
+        with tempfile.TemporaryDirectory() as d:
+            p = manifest.save(Path(d), {"generated": "t1", "weekly": True}, entry, {})
+            text, mtime = p.read_text(encoding="utf-8"), p.stat().st_mtime_ns
+            manifest.save(Path(d), {"generated": "t2", "weekly": True}, entry, manifest.load(Path(d)))
+            self.assertEqual((p.read_text(encoding="utf-8"), p.stat().st_mtime_ns), (text, mtime))
+            manifest.save(Path(d), {"generated": "t3", "weekly": False}, entry, manifest.load(Path(d)))
+            self.assertIn('"generated": "t3"', p.read_text(encoding="utf-8"))
+
+
+class TestFetchSeries(unittest.TestCase):
+    def test_run_returns_code_fetch_series_returns_results(self):
+        from unittest import mock
+
+        from s2fetch import pipeline
+
+        opt = pipeline.Options(SAMPLES / "field_boundary.geojson", "2026-08-01", "2026-08-07", Path("unused"))
+        with mock.patch.object(pipeline.catalog, "open_client", return_value=None), \
+                mock.patch.object(pipeline.catalog, "search", return_value={}):
+            self.assertEqual(pipeline.fetch_series(opt), (1, []))   # сцен нет
+            self.assertEqual(pipeline.run(opt), 1)
+
+
 if __name__ == "__main__":
     unittest.main()

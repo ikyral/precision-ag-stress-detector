@@ -12,13 +12,13 @@ Precision Ag Stress Detector — Модуль 4. Веб-кабинет агро�
 
 Что читается из папки данных (всё необязательно, дашборд показывает то, что есть):
   field_boundary.geojson | samples/field_boundary.geojson   граница поля (M1)
-  stats/index_stats_YYYY_MM_DD.json                          статистика M2 (schema 1.1)
+  stats/index_stats_YYYY_MM_DD.json                          статистика M2 (schema 1.1/1.2)
   indices/{NDVI|NDRE|MSAVI|NDMI}_YYYY_MM_DD.tif              растры индексов M2 (нужен rasterio)
   zones/zones_YYYY_MM_DD.tif                                 маска зон M2 (нужен rasterio)
   vra/ | prescriptions/ | . :
       prescription_YYYY_MM_DD.geojson  (zone_class, area_ha, fertilizer_rate | rate_kg_ha)  M3
       shapefile_YYYY_MM_DD.zip, metrics_YYYY_MM_DD.json                                     M3
-  overlays/{INDEX}_YYYY_MM_DD.png + overlays/meta.json      готовые PNG (мок-данные)
+  overlays/{INDEX|RGB|HIDDEN}_YYYY_MM_DD.png + meta.json    готовые PNG (M1 main_pipeline, мок-данные)
 
 Пока файлов M3 нет, экономика считается по площадям зон из index_stats (M2).
 """
@@ -28,6 +28,7 @@ from __future__ import annotations
 import copy
 import html
 import json
+import math
 import os
 import re
 from datetime import datetime
@@ -62,14 +63,16 @@ DATE_RE = re.compile(r"(\d{4}_\d{2}_\d{2})")
 ZONE_COLORS = {1: "#e74c3c", 2: "#f39c12", 3: "#2ecc71"}
 ZONE_SHORT = {1: "Острый стресс", 2: "Умеренный стресс", 3: "Норма"}
 ZONE_NAMES = {1: "Острый стресс (макс. доза)", 2: "Умеренный стресс (средняя доза)", 3: "Норма (без обработки)"}
-DEFAULT_RATE_FACTORS = {1: 1.0, 2: round(80 / 150, 4), 3: 0.0}  # доли от базовой нормы
+DEFAULT_RATE_FACTORS = {1: 1.0, 2: 80 / 150, 3: 0.0}  # доли от базовой нормы; не округляем при расчёте
 DEFAULT_BASE_RATE, DEFAULT_PRICE = 150, 45
-BASE_RATE_RANGE, PRICE_RANGE = (50, 300), (10, 150)  # границы слайдеров
+BASE_RATE_MAX, PRICE_MAX = 300.0, 150.0  # верх слайдеров (расширяется до значения из файла)
 MAX_RATE_FACTOR = 2.0  # доля нормы выше этого — скорее всего проценты вместо долей
 MAX_OVERLAY_PX = 1600  # растр крупнее не увеличиваем «блоками»
 
 LAYERS = {
     "Карта предписаний VRA": None,
+    "Снимок Sentinel-2 (RGB)": "RGB",
+    "Скрытый стресс (М2)": "HIDDEN",
     "Индекс раннего стресса NDRE": "NDRE",
     "Базовый индекс NDVI": "NDVI",
     "Почвенно-скорр. индекс MSAVI": "MSAVI",
@@ -82,6 +85,10 @@ CMAP_VEG = [(0.0, (165, 0, 38)), (0.25, (244, 109, 67)), (0.5, (254, 224, 139)),
 CMAP_WATER = [(0.0, (140, 81, 10)), (0.25, (216, 179, 101)), (0.5, (246, 232, 195)),
               (0.75, (90, 180, 172)), (1.0, (1, 102, 94))]
 INDEX_CMAPS = {"NDVI": CMAP_VEG, "NDRE": CMAP_VEG, "MSAVI": CMAP_VEG, "NDMI": CMAP_WATER}
+PNG_ONLY_LAYERS = {"RGB": "Sentinel-2 L2A, true color (B04, B03, B02)",  # есть только готовыми PNG М1
+                   "HIDDEN": "Скрытый стресс: NDRE падает раньше NDVI"}
+DEFAULT_NODATA_COLOR = (128, 128, 128, 150)  # облака и тени в PNG М1 (meta.nodata_color)
+DEFAULT_HIDDEN_COLOR = (231, 76, 60, 235)
 INDEX_SERIES = [("mean_ndvi", "NDVI", "#27ae60"), ("mean_ndre", "NDRE", "#c0392b"),
                 ("mean_msavi", "MSAVI", "#8d6e3f"), ("mean_ndmi", "NDMI", "#2980b9")]
 
@@ -98,6 +105,8 @@ st.markdown(
           border-radius: 12px; padding: 12px 16px;
       }
       div[data-testid="stMetricLabel"] p {font-size: 0.86rem; opacity: 0.8;}
+      div[data-testid="stMetricValue"] {font-size: 1.3rem;}
+      div[data-testid="stMetricValue"] > div {white-space: normal; overflow-wrap: anywhere;}
       .pas-alert {background: rgba(231, 76, 60, 0.12); border-left: 6px solid #e74c3c;
                   border-radius: 8px; padding: 12px 16px; margin: 4px 0 14px 0; font-size: 0.98rem;}
       .pas-alert ul {margin: 6px 0 0 0;}
@@ -127,10 +136,6 @@ def fmt_date(d: str) -> str:
 
 def fmt_num(x: float, digits: int = 0) -> str:
     return f"{x:,.{digits}f}".replace(",", " ").replace(".", ",")
-
-
-def clamp(x: float, bounds: tuple[float, float]) -> float:
-    return min(max(x, bounds[0]), bounds[1])
 
 
 # Проблемы с данными собираются за один прогон скрипта и выводятся блоком вверху страницы:
@@ -324,7 +329,12 @@ def index_overlay(ds: DataSource, index: str, d: str, stats, meta, vrange):
     """(rgba, bounds, источник) для слоя индекса или (None, None, причина)."""
     png = ds.overlay_png(index, d)
     if png is not None and meta.get("bounds") and Image is not None:
-        return np.array(Image.open(png).convert("RGBA")), meta["bounds"], "png"
+        try:
+            return np.array(Image.open(png).convert("RGBA")), meta["bounds"], "png"
+        except OSError as e:
+            report(f"`{png.name}` не открывается: {e}")
+    if index in PNG_ONLY_LAYERS:  # RGB и HIDDEN есть только готовыми PNG (overlays/ от main_pipeline М1)
+        return None, None, f"Слой {index} за {fmt_date(d)} не найден: запустите main_pipeline.py."
     tif = ds.index_raster(index, d, stats)
     if tif is None:
         return None, None, f"Растр {index} за {fmt_date(d)} не найден."
@@ -358,15 +368,19 @@ def index_block(stats: dict, index: str) -> dict | None:
 
 
 def season_ranges(stats_by_date: dict, meta: dict) -> dict:
-    """Единая шкала на весь сезон: min(p5)…max(p95) по всем датам M2."""
+    """Единая шкала на весь сезон: min(p5)…max(p95) по всем датам M2.
+
+    Самодостаточна (только np и константы): тест М1 test_overlays грузит её из app.py отдельно.
+    """
     ranges = {k: tuple(v) for k, v in DEFAULT_RANGES.items()}
     ranges.update({k: tuple(v) for k, v in (meta.get("index_ranges") or {}).items()})
-    for index in STATS_INDEX_KEYS:
+    for index, keys in STATS_INDEX_KEYS.items():
         lo, hi = [], []
         for s in stats_by_date.values():
-            block = index_block(s, index) or {}
-            p5, p95 = as_number(block.get("p5")), as_number(block.get("p95"))
-            if p5 is not None and p95 is not None:
+            indices = s.get("indices") if isinstance(s.get("indices"), dict) else {}
+            block = next((indices[k] for k in keys if isinstance(indices.get(k), dict)), {})
+            p5, p95 = block.get("p5"), block.get("p95")
+            if all(isinstance(v, (int, float)) and not isinstance(v, bool) for v in (p5, p95)):
                 lo.append(p5); hi.append(p95)
         if lo and max(hi) > min(lo):
             pad = 0.05 * (max(hi) - min(lo))
@@ -397,10 +411,16 @@ def zone_file_rate(z: dict) -> float | None:
     return as_number(z.get("rate_kg_ha", z.get("fertilizer_rate")))
 
 
+def declared_base_rate(metrics: dict) -> float | None:
+    """base_rate_kg_ha из файла M3 (или прежнее base_rate); 0 — допустимая «нулевая база»."""
+    base = as_number(metrics.get("base_rate_kg_ha", metrics.get("base_rate")))
+    return base if base is not None and base >= 0 else None
+
+
 def file_base_rate(metrics: dict) -> float | None:
     """Базовая норма, с которой M3 считал файл; если её нет — максимальная норма зоны (доза зоны 1)."""
-    base = as_number(metrics.get("base_rate_kg_ha"))
-    if base and base > 0:
+    base = declared_base_rate(metrics)
+    if base is not None:
         return base
     rates = [r for z in metrics.get("zone_breakdown") or [] if isinstance(z, dict)
              if (r := zone_file_rate(z)) is not None]
@@ -425,62 +445,103 @@ def metrics_from_stats(stats: dict | None) -> dict | None:
     }
 
 
-def zone_rate_factor(z: dict, file_base: float | None, src: str) -> tuple[float, bool]:
-    """(доля от базовой нормы, взята ли доля по умолчанию).
+def sanitize_metrics(metrics: dict) -> dict | None:
+    """Проверяет metrics (M3 или собранные из M2) до расчёта экономики. None — посчитать нельзя.
 
-    Порядок: rate_factor из файла → норма зоны / базовая норма файла → 100% / 53% / 0%.
+    Негодные зоны отбрасываются, недостающая базовая норма выводится из норм зон; всё, что
+    отброшено или подставлено, пишется в PROBLEMS. Проверки живут здесь, а не в recompute_economics:
+    её и prescription_rates_match тесты М3 грузят из app.py как самодостаточные функции.
     """
-    factor = as_number(z.get("rate_factor"))
-    if factor is None:
-        file_rate = zone_file_rate(z)
-        if file_rate is None or not file_base:
-            return DEFAULT_RATE_FACTORS[z["zone_class"]], True
-        factor = file_rate / file_base
-    if not 0 <= factor <= MAX_RATE_FACTOR:
-        report(f"{src}: доля нормы зоны {z['zone_class']} = {factor:g} вне диапазона 0–{MAX_RATE_FACTOR:g} "
-               "(проценты вместо долей?).")
-    return factor, False
-
-
-def recompute_economics(metrics: dict, base_rate: float, price: float) -> dict | None:
-    """Норма зоны = base_rate * rate_factor (см. zone_rate_factor). None — ни одной годной зоны."""
     from_m2 = metrics.get("_source") == "m2"
     src = "index_stats (M2)" if from_m2 else "metrics (M3)"
-    file_base = file_base_rate(metrics)
-    if not from_m2 and file_base and as_number(metrics.get("base_rate_kg_ha")) is None:
-        report(f"В {src} нет base_rate_kg_ha — базовой принята максимальная норма зоны, {fmt_num(file_base)} кг/га.")
-    zones, defaulted = [], []
-    for raw in metrics.get("zone_breakdown") or []:
-        z = parse_zone(raw, src)
-        if z is None:
-            continue
-        zc = z["zone_class"]
-        factor, is_default = zone_rate_factor(z, file_base, src)
-        if is_default:
-            defaulted.append(ZONE_SHORT[zc])
-        rate = base_rate * factor
-        zones.append({**z, "zone_name": z.get("zone_name") or ZONE_NAMES[zc],
-                      "rate_factor": factor, "rate_kg_ha": round(rate, 1), "total_kg": z["area_ha"] * rate})
-    if defaulted and not from_m2:
-        report(f"В {src} нет норм для зон: {', '.join(defaulted)} — подставлены нормы по умолчанию (100% / 53% / 0%).")
+    if metrics.get("quantity_unit", "kg") != "kg":
+        report(f"В {src} единица `{metrics.get('quantity_unit')}`, а кабинет считает только килограммы — "
+               "экономика не рассчитана.")
+        return None
+    zones = [z for z in (parse_zone(raw, src) for raw in metrics.get("zone_breakdown") or []) if z]
     if not zones:
         report(f"В {src} нет ни одной годной зоны — экономика не рассчитана.")
         return None
+    base = declared_base_rate(metrics)
+    if base is None:
+        base = file_base_rate({"zone_breakdown": zones})
+        if base is not None and not from_m2:
+            report(f"В {src} нет base_rate_kg_ha — базовой принята максимальная норма зоны, {fmt_num(base)} кг/га.")
+    clean_zones, defaulted = [], []
+    for z in zones:
+        rate, factor = zone_file_rate(z), as_number(z.get("rate_factor"))
+        entry = {k: v for k, v in z.items() if k not in ("rate_kg_ha", "fertilizer_rate", "rate_factor")}
+        if rate is not None:
+            entry["rate_kg_ha"] = rate
+        if factor is not None:
+            entry["rate_factor"] = factor
+            if not 0 <= factor <= MAX_RATE_FACTOR:
+                report(f"{src}: доля нормы зоны {z['zone_class']} = {factor:g} вне диапазона "
+                       f"0–{MAX_RATE_FACTOR:g} (проценты вместо долей?).")
+        elif rate is None:
+            defaulted.append(ZONE_SHORT[z["zone_class"]])
+        clean_zones.append(entry)
+    if defaulted and not from_m2:
+        report(f"В {src} нет норм для зон: {', '.join(defaulted)} — подставлены нормы по умолчанию (100% / 53% / 0%).")
+    if sum(z["area_ha"] for z in clean_zones) <= 0:
+        report(f"В {src} суммарная площадь зон равна 0 — проверьте поле area_ha и единицы (нужны гектары).")
+    clean = {k: v for k, v in metrics.items() if k != "base_rate"}
+    clean["zone_breakdown"] = clean_zones
+    if base is not None:
+        clean["base_rate_kg_ha"] = base
+    return clean
+
+
+def recompute_economics(metrics: dict, base_rate: float, price: float) -> dict:
+    """Норма зоны = base_rate * rate_factor; rate_factor берётся из файла
+    или выводится как rate_kg_ha / base_rate_kg_ha (с которыми файл был рассчитан).
+
+    Контракт М3 (src/module3/tests): ожидает данные после sanitize_metrics, кроме проверки единиц.
+    """
+    if metrics.get("quantity_unit", "kg") != "kg":
+        raise ValueError("This dashboard supports kilogram prescriptions only")
+    file_base = metrics.get("base_rate_kg_ha", metrics.get("base_rate"))
+    zones = []
+    for z in metrics.get("zone_breakdown", []):
+        zc = int(z["zone_class"])
+        factor = z.get("rate_factor")
+        file_rate = z.get("rate_kg_ha", z.get("fertilizer_rate"))
+        if factor is None:
+            factor = (file_rate / file_base) if (file_rate is not None and file_base) else DEFAULT_RATE_FACTORS.get(zc, 0)
+        # При нулевой базе доля не определена: нормы зон остаются из файла,
+        # слайдер меняет только вариант сплошного внесения для сравнения.
+        rate = file_rate if file_base == 0 and file_rate is not None else base_rate * factor
+        zones.append({**z, "zone_class": zc, "zone_name": z.get("zone_name") or ZONE_NAMES.get(zc, f"Зона {zc}"),
+                      "rate_factor": factor, "rate_kg_ha": rate, "total_kg": z["area_ha"] * rate})
     zones.sort(key=lambda z: z["zone_class"])
     total = sum(z["area_ha"] for z in zones)
-    if total <= 0:
-        report(f"В {src} суммарная площадь зон равна 0 — проверьте поле area_ha и единицы (нужны гектары).")
     stressed = sum(z["area_ha"] for z in zones if z["zone_class"] in (1, 2))
     uniform = total * base_rate
     smart = sum(z["total_kg"] for z in zones)
-    saved = max(0.0, uniform - smart)
+    saved = uniform - smart  # перерасход показываем отрицательной экономией
     return {
         "total_ha": total, "stressed_ha": stressed,
         "stressed_pct": stressed / total * 100 if total else 0.0,
         "uniform_kg": uniform, "smart_kg": smart, "saved_kg": saved,
-        "saved_pct": saved / uniform * 100 if uniform else 0.0,
+        "saved_pct": saved / uniform * 100 if uniform else None,
         "saved_rub": saved * price, "smart_rub": smart * price, "zones": zones,
     }
+
+
+def prescription_rates_match(metrics: dict, econ: dict | None) -> bool:
+    """Не предлагать скачать старый файл, если нормы на экране уже другие."""
+    if not econ:
+        return False
+    original = {int(z["zone_class"]): z for z in metrics.get("zone_breakdown", [])}
+    base = metrics.get("base_rate_kg_ha", metrics.get("base_rate"))
+    for zone in econ["zones"]:
+        source = original.get(zone["zone_class"], {})
+        rate = source.get("rate_kg_ha", source.get("fertilizer_rate"))
+        if rate is None and base is not None and source.get("rate_factor") is not None:
+            rate = base * source["rate_factor"]
+        if rate is None or not math.isclose(rate, zone["rate_kg_ha"], rel_tol=1e-10, abs_tol=1e-10):
+            return False
+    return True
 
 
 # ----------------------------------------------------------------------------
@@ -553,12 +614,12 @@ def normalize_prescription(gj, rates: dict | None, name: str):
     return gj
 
 
-def build_map(field_gj, presc_gj, raster_rgba, raster_bounds, outline_only):
+def build_map(field_gj, presc_gj, raster_rgba, raster_bounds, outline_only, raster_opacity=0.85):
     m = folium.Map(tiles=None, control_scale=True)
     folium.TileLayer(tiles=ESRI_TILES, attr=ESRI_ATTR, name="Спутник Esri", max_zoom=19).add_to(m)
 
     if raster_rgba is not None:
-        folium.raster_layers.ImageOverlay(image=raster_rgba, bounds=raster_bounds, opacity=0.85).add_to(m)
+        folium.raster_layers.ImageOverlay(image=raster_rgba, bounds=raster_bounds, opacity=raster_opacity).add_to(m)
 
     if field_gj:  # только контур (fill=False), чтобы не перехватывать подсказки зон
         folium.GeoJson(field_gj, name="Граница поля",
@@ -593,15 +654,47 @@ def show_map(fmap, key):
         st_folium(fmap, height=560, width=None, returned_objects=[], key=key)
 
 
-def legend_html(index, vrange):
+def meta_rgba(value, default) -> tuple:
+    """Цвет [r, g, b, a] из meta.json М1 или значение по умолчанию."""
+    ok = isinstance(value, (list, tuple)) and len(value) == 4 and all(as_number(v) is not None for v in value)
+    return tuple(int(v) for v in value) if ok else default
+
+
+def css_rgba(c) -> str:
+    return f"rgba({c[0]},{c[1]},{c[2]},{c[3] / 255:.2f})"
+
+
+def legend_swatches(items) -> str:
+    spans = "".join(f'<span><span class="sw" style="background:{color}"></span>{html.escape(label)}</span>'
+                    for color, label in items)
+    return f'<div class="pas-legend">{spans}</div>'
+
+
+def legend_html(index, vrange, meta: dict, from_png: bool) -> str:
+    """Легенда слоя. Для PNG М1 добавляется пункт «нет данных» (облака, тени), если они закрашены."""
     if index is None:
-        items = "".join(f'<span><span class="sw" style="background:{ZONE_COLORS[z]}"></span>{ZONE_SHORT[z]}</span>'
-                        for z in (1, 2, 3))
-        return f'<div class="pas-legend">{items}</div>'
+        return legend_swatches((ZONE_COLORS[z], ZONE_SHORT[z]) for z in (1, 2, 3))
+    nodata = []
+    if from_png and meta.get("nodata_mode", "gray") != "transparent":
+        nodata = [(css_rgba(meta_rgba(meta.get("nodata_color"), DEFAULT_NODATA_COLOR)), "Нет данных (облака, тени)")]
+    if index == "RGB":
+        return f'<div class="pas-legend"><span>{PNG_ONLY_LAYERS["RGB"]}</span></div>'
+    if index == "HIDDEN":
+        hidden = meta.get("hidden") if isinstance(meta.get("hidden"), dict) else {}
+        color = meta_rgba(hidden.get("1", hidden.get("color")), DEFAULT_HIDDEN_COLOR)
+        return legend_swatches([(css_rgba(color), PNG_ONLY_LAYERS["HIDDEN"])] + nodata)
     grad = ", ".join(f"rgb({c[0]},{c[1]},{c[2]}) {s * 100:.0f}%" for s, c in INDEX_CMAPS[index])
     return (f'<div class="pas-bar" style="background: linear-gradient(90deg, {grad});"></div>'
             f'<div class="pas-bar-labels"><span>{vrange[0]:.2f}</span><span>{index}</span>'
-            f'<span>{vrange[1]:.2f}</span></div>')
+            f'<span>{vrange[1]:.2f}</span></div>' + (legend_swatches(nodata) if nodata else ""))
+
+
+def legend_range(index: str, vranges: dict, meta: dict, from_png: bool):
+    """Шкала легенды: для PNG — та, по которой М1 их окрасил (meta.index_ranges), иначе — сезонная по stats."""
+    r = (meta.get("index_ranges") or {}).get(index) if from_png else None
+    if isinstance(r, (list, tuple)) and len(r) == 2 and all(as_number(v) is not None for v in r):
+        return float(r[0]), float(r[1])
+    return vranges.get(index)
 
 
 # ----------------------------------------------------------------------------
@@ -759,30 +852,53 @@ with st.sidebar:
         report(f"`{metrics_path.name}`: нет списка zone_breakdown — экономика посчитана по данным Модуля 2.")
         m3_metrics = None
     metrics = m3_metrics or metrics_from_stats(stats) or {}
-    file_base = file_base_rate(metrics)
-    file_price = as_number(metrics.get("price_per_kg"))
+    clean_metrics = sanitize_metrics(metrics) if metrics.get("zone_breakdown") else None
+    file_base = file_base_rate(clean_metrics or metrics)
+    file_base = DEFAULT_BASE_RATE if file_base is None else file_base
+    file_price = as_number(metrics.get("price_per_kg", metrics.get("price_per_unit")))
+    file_price = DEFAULT_PRICE if file_price is None or file_price < 0 else file_price
 
     st.divider()
     st.markdown("**Параметры экономики**")
-    base_rate = st.slider("Базовая норма удобрений, кг/га", *BASE_RATE_RANGE,
-                          int(round(clamp(file_base or DEFAULT_BASE_RATE, BASE_RATE_RANGE))), step=5)
-    price = st.slider("Цена удобрения, ₽/кг", *PRICE_RANGE,
-                      int(round(clamp(file_price or DEFAULT_PRICE, PRICE_RANGE))), step=1)
+    base_rate = st.slider("Базовая норма удобрений, кг/га", 0.0, max(BASE_RATE_MAX, file_base),
+                          float(file_base), step=5.0)
+    price = st.slider("Цена удобрения, ₽/кг", 0.0, max(PRICE_MAX, file_price), float(file_price), step=1.0)
+    econ = recompute_economics(clean_metrics, base_rate, price) if clean_metrics else None
+    downloads_match = prescription_rates_match(clean_metrics, econ) if m3_metrics and clean_metrics else False
+    coverage = metrics.get("coverage") if isinstance(metrics.get("coverage"), dict) else {}
+    unclassified = as_number(coverage.get("unclassified_area_ha"))
+    if coverage.get("is_complete", True) is False and unclassified is not None:
+        st.warning(f"Неполное покрытие: без класса {unclassified:.2f} га. "
+                   "В файлах этим участкам норма не назначена; для полного задания требуется решение М2.")
+    filled_area = as_number((stats or {}).get("filled_area_ha")) or 0
+    if filled_area > 0:
+        st.warning(f"Восстановлено М2: {filled_area:.2f} га "
+                   f"({as_number((stats or {}).get('filled_percent')) or 0:.2f}% поля). "
+                   "Облака и тени получили класс ближайшей зоны; это не прямое наблюдение. "
+                   "Эти участки включены в предписание и расчёт экономики.")
+    if m3_metrics and file_base == 0:
+        st.caption("При нулевой исходной базе нормы зон фиксированы; ползунок меняет только сплошной вариант сравнения.")
 
     st.divider()
     st.markdown("**Файлы для бортового компьютера**")
+    if m3_metrics:
+        st.caption(f"Файлы рассчитаны для нормы сравнения {file_base:g} кг/га "
+                   f"и цены {file_price:g} ₽/кг. Нормы зон заданы в предписании.")
     gj_path = ds.vra_file(f"prescription_{sel_date}.geojson")
     zip_path = ds.vra_file(f"shapefile_{sel_date}.zip")
     if gj_path:
         st.download_button("⬇️ Карта-предписание (.geojson)", gj_path.read_bytes(),
-                           file_name=gj_path.name, mime="application/geo+json")
+                           file_name=gj_path.name, mime="application/geo+json", disabled=not downloads_match)
     if zip_path:
         st.download_button("⬇️ Shapefile для трактора (.zip)", zip_path.read_bytes(),
-                           file_name=zip_path.name, mime="application/zip")
+                           file_name=zip_path.name, mime="application/zip", disabled=not downloads_match)
     if not gj_path and not zip_path:
         st.caption("Файлы-задания появятся, когда Модуль 3 сформирует предписание за эту дату.")
-    elif m3_metrics and file_base and base_rate != round(file_base):
-        st.caption(f"Файлы рассчитаны для нормы {fmt_num(file_base)} кг/га.")
+    elif not m3_metrics:
+        st.caption("Скачивание отключено: нет metrics_*.json Модуля 3 за эту дату, нормы файлов не проверить.")
+    elif not downloads_match:
+        st.warning("Нормы на экране отличаются от сохранённых файлов. Верните исходную норму "
+                   "или создайте новое предписание в М3; скачивание текущих файлов отключено.")
     st.caption(f"Данные: `{ds.root}`")
 
 # --- Шапка
@@ -793,16 +909,20 @@ stress_banner(stats)
 problems_box = st.container()  # заполняется в конце, когда известны все проблемы с данными
 
 # --- KPI
-econ = recompute_economics(metrics, base_rate, price) if metrics.get("zone_breakdown") else None
 k1, k2, k3, k4 = st.columns(4)
 if econ:
-    k1.metric("Общая площадь поля", f"{fmt_num(econ['total_ha'], 1)} га")
+    k1.metric("Площадь с классификацией", f"{fmt_num(econ['total_ha'], 1)} га")
+    field_ha = as_number(coverage.get("reference_field_area_ha"))
+    if field_ha is not None and unclassified is not None:
+        st.caption(f"Полный контур: {fmt_num(field_ha, 2)} га; без классификации: {fmt_num(unclassified, 2)} га. "
+                   "Расход и экономия рассчитаны только по классифицированной площади.")
     k2.metric("Зоны стресса", f"{fmt_num(econ['stressed_ha'], 1)} га",
               f"{fmt_num(econ['stressed_pct'], 1)}% поля", delta_color="inverse")
     k3.metric("Сэкономлено удобрений", f"{fmt_num(econ['saved_kg'])} кг",
-              f"{fmt_num(econ['saved_pct'], 1)}% от сплошного внесения")
-    k4.metric("Финансовая экономия", f"{fmt_num(econ['saved_rub'])} ₽",
-              f"затраты {fmt_num(econ['smart_rub'])} ₽ вместо {fmt_num(econ['uniform_kg'] * price)} ₽",
+              f"{fmt_num(econ['saved_pct'], 1)}% от сплошного внесения" if econ["saved_pct"] is not None
+              else "Процент не определён: нулевая база")
+    k4.metric("Финансовая экономия", f"{fmt_num(econ['saved_rub'], 2)} ₽",
+              f"затраты {fmt_num(econ['smart_rub'], 2)} ₽ вместо {fmt_num(econ['uniform_kg'] * price, 2)} ₽",
               delta_color="off")
     if metrics.get("_source") == "m2":
         st.caption("Экономика рассчитана по площадям зон из статистики Модуля 2 "
@@ -820,20 +940,24 @@ with left:
         # нормы по умолчанию из M2 не должны подменять реальные нормы M3 в подсказках
         rates = {z["zone_class"]: z["rate_kg_ha"] for z in econ["zones"]} if econ and m3_metrics else None
         presc = normalize_prescription(presc, rates, gj_path.name)
-    rgba, rbounds = None, None
+    rgba, rbounds, from_png = None, None, False
     if index_name:
-        rgba, rbounds, info = index_overlay(ds, index_name, sel_date, stats, meta, vranges[index_name])
+        rgba, rbounds, info = index_overlay(ds, index_name, sel_date, stats, meta, vranges.get(index_name))
         if rgba is None:
             st.info(info)
+        from_png = info == "png"
     elif not presc:
         rgba, rbounds = zones_overlay(ds, sel_date, stats)
         if rgba is not None:
             st.caption("Показана растровая маска зон Модуля 2. Полигоны с нормами появятся после Модуля 3.")
         else:
             st.info("Карта-предписание за эту дату ещё не сформирована.")
-    fmap = build_map(field_gj, presc, rgba, rbounds, outline_only=index_name is not None)
+    # у PNG М1 альфа уже в картинке; tif М2 приглушаем, чтобы просвечивала подложка
+    fmap = build_map(field_gj, presc, rgba, rbounds, outline_only=index_name is not None,
+                     raster_opacity=1.0 if from_png else 0.85)
     show_map(fmap, key=f"map_{src_name}_{sel_date}_{index_name}")
-    st.markdown(legend_html(index_name, vranges.get(index_name) if index_name else None), unsafe_allow_html=True)
+    st.markdown(legend_html(index_name, legend_range(index_name, vranges, meta, from_png), meta, from_png),
+                unsafe_allow_html=True)
 
 with right:
     rows = []
@@ -858,7 +982,7 @@ with right:
 if econ:
     with st.expander("Нормы внесения по зонам"):
         st.dataframe(pd.DataFrame([{
-            "Зона": z["zone_name"], "Площадь, га": round(z["area_ha"], 2), "Норма, кг/га": z["rate_kg_ha"],
+            "Зона": z["zone_name"], "Площадь, га": round(z["area_ha"], 2), "Норма, кг/га": round(z["rate_kg_ha"], 1),
             "Удобрения, кг": round(z["total_kg"], 1), "Стоимость, ₽": round(z["total_kg"] * price),
         } for z in econ["zones"]]), hide_index=True)
 

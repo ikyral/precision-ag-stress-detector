@@ -1,61 +1,45 @@
 # Модуль 3 — Кузнецов Кирилл
 
-В этот проект добавлен готовый модуль генерации VRA-карт и экономического отчёта.
-Основной код находится в `src/module3/vra/`, подробная инструкция — в
-[`src/module3/README.md`](src/module3/README.md).
+Обновление от 28.10.2026 на базе архива main после PR #9 М2.
+Подробный отчёт: [docs/module3_season_2026.md](docs/module3_season_2026.md).
 
-## Быстрый запуск в Windows
-
-Откройте PowerShell в корне распакованного проекта:
+## Запуск из корня проекта
 
 ```powershell
 python -m venv .venv
-.\.venv\Scripts\python.exe -m pip install -r src/module3/requirements.txt
-.\.venv\Scripts\python.exe src/module3/examples/run_samples.py
+.\.venv\Scripts\python.exe -m pip install -r src/module2/requirements.txt -r src/module3/requirements.txt -r src/module4/requirements.txt
+.\.venv\Scripts\python.exe src/module3/examples/run_real_season.py
+.\.venv\Scripts\python.exe src/module3/examples/verify_real_season.py
+.\.venv\Scripts\python.exe -m streamlit run src/module4/app.py
 ```
 
-Нужен Python 3.11 или новее. Если команда `python` не находится, укажите полный
-путь к установленному Python. На компьютере, использованном для проверки, это:
+Проверено на Python 3.12.14. Скрипт заново обрабатывает восемь исходных сцен
+через М2 и М3. Результаты: `data/prescriptions/` (GeoJSON, Shapefile ZIP,
+JSON-экономика, сводка и аудит покрытия). М2 также создаёт `data/stats`,
+`data/indices`, `data/zones` для кабинета. Эти данные исключены из Git;
+в полном архиве поставки они приложены, после клонирования их надо создать.
+
+## Если М2 уже сформировал маски
 
 ```powershell
-& "$env:LOCALAPPDATA\Programs\Python\Python314\python.exe" -m venv .venv
+python -m pip install -e src/module3
+python -m vra run data/zones -o data/prescriptions --reference-mask data/samples/sample_zones.tif
 ```
 
-Далее используйте команды через `.\.venv\Scripts\python.exe`, как выше.
-Это отдельное окружение проекта; установка библиотек не меняет системные пакеты.
-
-## Готовые результаты
-
-- `data/module3_demo/sample/` — карта по тестовой маске `sample_zones.tif`.
-- `data/module3_demo/module2/` — карта по маске аналитического модуля `sample_zones_m2.tif`.
-- `data/module3_demo/pipeline_m2_m3/` — результат полного прогона исходного снимка через модули 2 и 3.
-- `data/module3_demo/synthetic_season/` — шесть искусственных недель для проверки пакетной обработки.
-- В каждой папке результата есть GeoJSON, JSON с экономикой, ZIP и распакованные компоненты Shapefile.
-- `validation/` — протоколы проверок поставки.
-
-Второй пример подходит для демонстрации стыковки с модулем 2. Первый — тестовая
-разбивка по NDVI. Это не подтверждённые очаги болезни. Нормы 150 / 80 / 0 кг/га и
-цена 45 руб./кг взяты из учебного ТЗ.
-
-## Запуск на новых масках
-
-```powershell
-.\.venv\Scripts\python.exe -m pip install -e src/module3
-.\.venv\Scripts\python.exe -m vra run data/zones -o data/prescriptions --rates 1=150,2=80,3=0 --base-rate 150 --price 45
-```
-
-Каталог `data/zones` должен содержать `zones_YYYY_MM_DD.tif` для одного поля.
-Для одиночного файла без даты в имени добавьте `--date 2026-08-07`.
-Полный формат JSON, перерасчёт экономики, режим литров и настройки фильтрации
-описаны в инструкции модуля.
+Нормы по умолчанию: 150/80/0 кг/га, база сравнения 150, цена 45 руб./кг.
+Новый сценарий задаётся явно: `--rates 1=200,2=100,3=0 --base-rate 200 --price 50`.
+Изменение ползунка в кабинете моделирует экономику, но не генерирует новые
+файлы: при изменении норм скачивание старого задания отключено.
 
 ## Проверки
 
 ```powershell
-.\.venv\Scripts\python.exe -m unittest discover -s src/module3/tests -v
-.\.venv\Scripts\python.exe src/module3/examples/create_demo_season.py
+python -m unittest discover -s src/module3/tests -v
+python src/module3/examples/verify_real_season.py
 ```
 
-В исходном архиве нет реального ряда за сезон и готового модуля 4. Генерация файлов
-для них реализована; проверка отображения в будущем кабинете и импорта в конкретную
-модель бортового компьютера остаётся этапом командной интеграции.
+М3 использует классификацию М2. Облачные участки, которым М2 присвоил класс
+ближайшей зоны, включаются в предписание. На 18 июля восстановлено 4,12 га;
+это явно отмечено в аудите и кабинете. На всех восьми датах площадь 79,6 га.
+Оставшийся nodata М3 не заполняет. Нормы учебные; импорт в конкретный бортовой
+компьютер и общий main_pipeline.py не входят в эти проверки.

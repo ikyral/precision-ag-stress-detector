@@ -166,6 +166,13 @@ def print_table(results: list[DateResult], opt: Options) -> None:
 
 
 def run(opt: Options) -> int:
+    """CLI: код выхода 0 — ок, 1 — ошибки/нет сцен, 2 — сетка не совпала с эталоном."""
+    return fetch_series(opt)[0]
+
+
+def fetch_series(opt: Options) -> tuple[int, list[DateResult]]:
+    """Как run(), плюс результаты по датам: status 'written' (записана в этом запуске), 'exists'
+    (уже была, не перезаписана), 'error', 'evaluated' (не выбрана); selected — выбрана."""
     geom = load_boundary(opt.boundary)
     bbox = boundary_bbox(geom)
     client = catalog.open_client()
@@ -178,7 +185,7 @@ def run(opt: Options) -> int:
           + (f"; отброшены плитки {', '.join(other_tiles)}" if other_tiles else ""), flush=True)
     if not per_date:
         print("Сцен не найдено")
-        return 1
+        return 1, []
 
     manual_polys = manual.load(opt.manual_masks)
     if manual_polys:
@@ -197,13 +204,13 @@ def run(opt: Options) -> int:
         diffs = compare_grids(grid, grid_of_file(opt.reference))
         if diffs:
             print("Сетка не совпадает с эталоном", opt.reference, ":", "; ".join(diffs))
-            return 2
+            return 2, []
         import rasterio
         with rasterio.open(opt.reference) as ref:
             ref_inside = ref.read(1) != 0
         if not np.array_equal(ref_inside, inside):
             print(f"Маска поля не совпадает с эталоном: {int((ref_inside != inside).sum())} px")
-            return 2
+            return 2, []
         print(f"Сетка и маска поля совпадают с эталоном {opt.reference.name}")
 
     # --- оценка облачности по датам ---
@@ -229,11 +236,12 @@ def run(opt: Options) -> int:
     print_table(results, opt)
     if opt.dry_run:
         print("\n--dry-run: файлы не записаны")
-        return 0
+        return 0, results
 
     # --- запись выбранных сцен ---
     prev_dir = opt.out / "preview"
     pngs = []
+    fresh = False  # записано хоть одно превью — пересобрать all_dates.png
     for r in results:
         path = opt.out / scene_filename(r.date)
         if r.selected:
@@ -263,11 +271,15 @@ def run(opt: Options) -> int:
                     traceback.print_exc()
                     continue
             if r.status == "exists":
-                import rasterio
-                with rasterio.open(path) as src:
-                    p = prev_dir / f"{path.stem}.png"
-                    preview.save_png(p, preview.render(src.read(), inside),
-                                     f"{r.date}  RGB | NDVI | mask (из файла)")
+                p = prev_dir / f"{path.stem}.png"
+                if not p.exists() or p.stat().st_mtime < path.stat().st_mtime:  # превью старше сцены
+                    import rasterio
+                    with rasterio.open(path) as src:
+                        preview.save_png(p, preview.render(src.read(), inside),
+                                         f"{r.date}  RGB | NDVI | mask (из файла)")
+                    fresh = True
+            else:
+                fresh = True
             pngs.append(p)
         elif r.s2c_only_reject:
             # отсеяна только s2cloudless — превью для ручной проверки ложных срабатываний
@@ -279,7 +291,7 @@ def run(opt: Options) -> int:
                                  f"union {r.verdict.union_percent:.1f}%")
             except Exception as exc:  # noqa: BLE001
                 print(f"{r.date}: превью отброшенной сцены не сделано: {exc}")
-    if pngs:
+    if pngs and (fresh or not (prev_dir / "all_dates.png").exists()):
         preview.contact_sheet(pngs, prev_dir / "all_dates.png")
 
     stale = sorted({p.name for p in opt.out.glob("scene_*.tif")}
@@ -304,7 +316,7 @@ def run(opt: Options) -> int:
     errors = [r for r in results if r.status == "error"]
     print(f"\nМанифест: {mp}; записано/есть: "
           f"{sum(r.status in ('written', 'exists') for r in results)}, ошибок: {len(errors)}")
-    return 1 if errors else 0
+    return (1 if errors else 0), results
 
 
 def _dates_outside(opt: Options, out_dir: Path) -> list[str]:

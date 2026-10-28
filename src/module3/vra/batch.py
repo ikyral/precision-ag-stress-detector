@@ -59,6 +59,7 @@ def run_series(
                 "stressed_area_ha": metrics["stressed_area_ha"],
                 "saved_percent": metrics["saved_percent"],
                 "saved_money_rub": metrics["saved_money_rub"],
+                "coverage": metrics.get("coverage"),
                 "files": {"geojson": Path(geojson).name,
                           "shapefile_zip": Path(archive).name,
                           "metrics": Path(metrics_path).name},
@@ -75,10 +76,11 @@ def run_series(
         "area_tolerance_ha": area_tolerance_ha,
         "area_range_ha": [min(areas), max(areas)] if areas else None,
         "area_spread_ha": spread, "area_stable": stable,
-        "coverage_note": "Area includes classified pixels only. No-data gaps are excluded. One input directory must contain one field.",
+        "coverage_note": "Area includes classified pixels, including upstream-filled classes. Remaining input nodata is excluded. See M2 stats for observed/filled area. One input directory must contain one field.",
         "warnings": (["Classified field area changes between dates; inspect no-data masks and alignment."]
                      if stable is False else []),
         "records": rows, "errors": errors,
+        "incomplete_dates": [r["date"] for r in rows if r["coverage"] and not r["coverage"]["is_complete"]],
     }
     (out / "season_summary.json").write_text(
         json.dumps(report, ensure_ascii=False, indent=2, allow_nan=False), encoding="utf-8")
