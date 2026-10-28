@@ -5,11 +5,13 @@
 1. PAS_DATA_DIR = <data_dir>: все даты × все слои карты рисуются без исключений и без сообщений
    «Растр … не найден»; на датах с filled_area_ha > 0 есть предупреждение «Восстановлено М2».
 2. Копия <data_dir> без indices/*.tif: слои индексов всё равно рисуются — значит, М4 берёт PNG из overlays/.
+3. Список слоёв — из LAYERS app.py (ast): радио кабинета совпадает с ним, у каждого слоя-растра есть PNG всех дат.
 Печатает JSON-сводку; код выхода 0 — всё прошло, 1 — нет.
 """
 from __future__ import annotations
 
 import argparse
+import ast
 import json
 import os
 import shutil
@@ -19,7 +21,16 @@ from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[3]
 APP = ROOT / "src" / "module4" / "app.py"
-INDEX_LABELS = {"NDVI", "NDRE", "MSAVI", "NDMI"}
+INDEX_LAYERS = {"NDVI", "NDRE", "MSAVI", "NDMI"}  # слои индексов, для которых М1 рисует PNG
+
+
+def app_layers(app: Path = APP) -> dict:
+    """LAYERS из app.py М4 через ast (без импорта streamlit): {подпись: слой или None}."""
+    for node in ast.parse(app.read_text(encoding="utf-8")).body:
+        if (isinstance(node, ast.Assign) and len(node.targets) == 1 and isinstance(node.targets[0], ast.Name)
+                and node.targets[0].id == "LAYERS"):
+            return ast.literal_eval(node.value)
+    raise ValueError(f"{app}: нет LAYERS")
 
 
 def _stats(data: Path) -> dict[str, dict]:
@@ -80,9 +91,18 @@ def check(data: Path, expect_dates: int | None = None) -> dict:
     problems = [f"полная папка: {p}" for p in full["problems"]] + [f"без tif: {p}" for p in png_only["problems"]]
     if expect_dates is not None and len(full.get("dates", [])) != expect_dates:
         problems.append(f"дат {len(full.get('dates', []))}, ожидалось {expect_dates}")
-    if not INDEX_LABELS <= {lbl.split()[-1] for lbl in full.get("layers", [])}:
-        problems.append(f"не все слои индексов в кабинете: {full.get('layers')}")
-    return {"ok": not problems, "full": full, "png_only": png_only, "problems": problems}
+    layers = app_layers()
+    if full.get("layers") != list(layers):
+        problems.append(f"слои кабинета {full.get('layers')} не совпадают с LAYERS app.py {list(layers)}")
+    if not INDEX_LAYERS <= set(layers.values()):
+        problems.append(f"не все слои индексов в кабинете: {sorted(set(layers.values()) - {None})}")
+    meta_layers = (json.loads((data / "overlays" / "meta.json").read_text(encoding="utf-8")).get("layers") or {}
+                   if (data / "overlays" / "meta.json").exists() else {})
+    for name in sorted({v for v in layers.values() if v is not None}):
+        lost = [d for d in full.get("dates", []) if name not in meta_layers.get(d.replace("-", "_"), {})]
+        if lost:
+            problems.append(f"слой {name} из LAYERS: нет PNG в overlays/meta.json для {', '.join(lost)}")
+    return {"ok": not problems, "app_layers": layers, "full": full, "png_only": png_only, "problems": problems}
 
 
 def main(argv=None) -> int:
