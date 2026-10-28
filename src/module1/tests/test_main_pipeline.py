@@ -243,6 +243,124 @@ class TestSeasonSummary(unittest.TestCase):
             self.assertEqual((d / "x.json").read_bytes(), (d / "b" / "season_summary.json").read_bytes())
 
 
+@unittest.skipUnless(_has("geopandas", "pyogrio", "vra", "rasterio"), "нужны зависимости М3 (geopandas, pyogrio)")
+class TestCrsAudit(unittest.TestCase):
+    """crs_audit: на согласованных выходах ok; испорченный .prj, сдвинутый GeoJSON, неверная площадь,
+    чужой source_grid и неполный ZIP ловятся."""
+    STAMP = "2026_08_07"
+
+    @classmethod
+    def setUpClass(cls):
+        import rasterio
+        from vra import generate_prescription
+
+        from s2fetch.grid import grid_of_file
+
+        cls.tmp = tempfile.TemporaryDirectory(prefix="crs-audit-")
+        cls.base = Path(cls.tmp.name) / "base"
+        (cls.base / "zones").mkdir(parents=True)
+        zones = cls.base / "zones" / f"zones_{cls.STAMP}.tif"
+        shutil.copy(mp.REF_ZONES, zones)
+        generate_prescription(str(zones), str(cls.base / "prescriptions"), cls.STAMP,
+                              reference_mask_path=str(mp.REF_ZONES))
+        with rasterio.open(zones) as z:
+            area = float(((z.read(1) >= 1) & (z.read(1) <= 3)).sum() * 100 / 10_000)
+        (cls.base / "stats").mkdir()
+        (cls.base / "stats" / f"index_stats_{cls.STAMP}.json").write_text(json.dumps(
+            {"field_area_ha": area, "grid": {"width": 104, "height": 104, "pixel_area_m2": 100.0, "crs_epsg": 32637}}),
+            encoding="utf-8")
+        cls.ref = grid_of_file(mp.REF_SCENE)
+        (cls.base / "overlays").mkdir()
+        (cls.base / "overlays" / "meta.json").write_text(json.dumps({"source_grid": {
+            "crs": cls.ref.crs, "transform": list(cls.ref.transform)[:6], "size": [cls.ref.width, cls.ref.height]}}),
+            encoding="utf-8")
+
+    @classmethod
+    def tearDownClass(cls):
+        cls.tmp.cleanup()
+
+    def _copy(self) -> Path:
+        d = Path(tempfile.mkdtemp(dir=self.tmp.name))
+        shutil.copytree(self.base, d / "data")
+        return d / "data"
+
+    def _audit(self, data: Path) -> dict:
+        return mp.crs_audit(data, self.ref)
+
+    def _rezip(self, data: Path, fn) -> None:
+        zpath = data / "prescriptions" / f"shapefile_{self.STAMP}.zip"
+        with zipfile.ZipFile(zpath) as zf:
+            parts = {n: zf.read(n) for n in zf.namelist()}
+        parts = fn(parts)
+        with zipfile.ZipFile(zpath, "w") as zf:
+            for n, b in parts.items():
+                zf.writestr(n, b)
+
+    def test_clean_outputs_ok(self):
+        a = self._audit(self.base)
+        self.assertTrue(a["ok"], a["errors"])
+        rec = a["dates"][self.STAMP]
+        self.assertEqual((rec["shp_epsg"], rec["shp_parts"]), (32637, [".cpg", ".dbf", ".prj", ".shp", ".shx"]))
+        self.assertLessEqual(rec["geojson_max_outside_m"], mp.COVER_TOLERANCE_M)
+        for k in ("area_geojson_ha", "area_shp_ha", "area_zone_breakdown_ha", "area_zones_ha", "area_stats_ha"):
+            self.assertAlmostEqual(rec[k], rec["area_metrics_ha"], delta=mp.AREA_TOLERANCE_HA, msg=k)
+        self.assertEqual(a["meta_source_grid"], "совпадает с сеткой сцен")
+        self.assertIn("crs_audit: ok", mp.crs_audit_line(a))
+
+    def test_bad_prj_detected(self):
+        from pyproj import CRS
+
+        data = self._copy()
+        wgs = CRS.from_epsg(4326).to_wkt("WKT1_ESRI").encode()
+        self._rezip(data, lambda p: {n: (wgs if n.endswith(".prj") else b) for n, b in p.items()})
+        a = self._audit(data)
+        self.assertFalse(a["ok"])
+        self.assertEqual(a["dates"][self.STAMP]["shp_epsg"], 4326)
+        self.assertTrue(any("CRS .prj EPSG:4326" in e for e in a["errors"]), a["errors"])
+
+    def test_incomplete_zip_detected(self):
+        data = self._copy()
+        self._rezip(data, lambda p: {n: b for n, b in p.items() if not n.endswith(".cpg")})
+        a = self._audit(data)
+        self.assertFalse(a["ok"])
+        self.assertTrue(any("состав" in e for e in a["errors"]), a["errors"])
+
+    def test_shifted_geojson_detected(self):
+        data = self._copy()
+        p = data / "prescriptions" / f"prescription_{self.STAMP}.geojson"
+        gj = _json(p)
+
+        def shift(c):
+            return [c[0] + 0.001, c[1]] if isinstance(c[0], (int, float)) else [shift(x) for x in c]
+        for f in gj["features"]:
+            f["geometry"]["coordinates"] = shift(f["geometry"]["coordinates"])
+        p.write_text(json.dumps(gj), encoding="utf-8")
+        a = self._audit(data)
+        self.assertFalse(a["ok"])
+        self.assertGreater(a["dates"][self.STAMP]["geojson_max_outside_m"], 70)      # 0,001° lon ≈ 75 м
+        self.assertTrue(any("за контуром поля" in e for e in a["errors"]), a["errors"])
+
+    def test_wrong_area_detected(self):
+        data = self._copy()
+        p = data / "prescriptions" / f"metrics_{self.STAMP}.json"
+        m = _json(p)
+        m["total_field_area_ha"] += 0.5
+        p.write_text(json.dumps(m), encoding="utf-8")
+        a = self._audit(data)
+        self.assertFalse(a["ok"])
+        self.assertEqual(len([e for e in a["errors"] if "площадь" in e]), 5, a["errors"])   # все 5 сверок
+
+    def test_foreign_source_grid_detected(self):
+        data = self._copy()
+        p = data / "overlays" / "meta.json"
+        m = _json(p)
+        m["source_grid"]["transform"][2] += 10.0
+        p.write_text(json.dumps(m), encoding="utf-8")
+        a = self._audit(data)
+        self.assertFalse(a["ok"])
+        self.assertTrue(any("source_grid" in e for e in a["errors"]), a["errors"])
+
+
 @unittest.skipUnless(SLOW, "медленный тест: PAS_SLOW_TESTS=1")
 @unittest.skipUnless(_has("geopandas", "stress_core", "vra") and len(SCENES) >= 3, "нужны М2, М3 и data/scenes")
 class TestPipelineIncremental(unittest.TestCase):
@@ -274,6 +392,9 @@ class TestPipelineIncremental(unittest.TestCase):
         self.assertEqual(len(list((self.one / "overlays").glob("*_20*.png"))), 6 * len(SCENES))
         summary = _json(self.one / "prescriptions" / "season_summary.json")
         self.assertTrue(summary["area_stable"])
+        audit = self.all_report["checks"]["crs_audit"]
+        self.assertTrue(audit["ok"], audit["errors"])
+        self.assertEqual(audit["summary"]["dates"], len(SCENES))
         self.assertEqual(summary["dates_processed"], len(SCENES))
 
     def test_2_rerun_changes_nothing(self):

@@ -47,7 +47,9 @@
    - CRS, transform и размер у `scenes`, `zones`, `indices`, `hidden_stress` такие же, как у `sample_scene.tif`;
    - `meta.bounds` покрывают рамку `field_boundary.geojson`;
    - рамки GeoJSON предписаний покрывают её с допуском 10 м;
-   - все PNG одного размера.
+   - все PNG одного размера;
+   - `crs_audit` (КТ4): CRS Shapefile и GeoJSON М3, вершины внутри контура, согласованность площадей М2/М3,
+     `index_stats.grid` и `meta.source_grid` — см. `docs/module1_kt4.md`.
 6. **Отчёт** `<data>/pipeline_report.json` и сводка в консоль. Код выхода: 0 — ок, 1 — ошибки обработки,
    2 — проверки не прошли.
 
