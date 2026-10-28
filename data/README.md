@@ -1,10 +1,79 @@
-# Форматы данных
+# Данные и форматы обмена
 
-- M1 -> M2: `scene_YYYY_MM_DD.tif` (многоканальный, UTM)
-- M2 -> M3: `zones_YYYY_MM_DD.tif` (uint8: 0 фон, 1 сильный стресс, 2 умеренный, 3 норма)
-- M3 -> M4: `prescription_YYYY_MM_DD.geojson` (zone_class, area_ha, fertilizer_rate) и `metrics_YYYY_MM_DD.json`
+Цепочка: М1 (`scenes/`) → М2 (`zones/`, `stats/`, `indices/`, `hidden_stress/`) → М3 (`prescriptions/`) →
+М1 (`overlays/` для кабинета) → М4 (читает всё это). Целиком её запускает `main_pipeline.py` из корня
+репозитория:
 
-## sample_scene.tif
+```bash
+python main_pipeline.py --skip-fetch                          # по сценам, которые уже лежат в data/scenes
+python main_pipeline.py --start 2026-06-29 --end 2026-08-30   # сначала докачать новые сцены (ключи CDSE в .env)
+```
+
+## Раскладка `data/` после конвейера
+
+| Путь | Кто пишет | В git | Содержимое |
+|---|---|---|---|
+| `samples/` | М1 (КТ1) | да | эталоны: `sample_scene.tif`, `sample_zones.tif`, `field_boundary.geojson` (см. ниже) |
+| `scenes/scene_YYYY_MM_DD.tif` | М1 `s2fetch` | да | серия сцен сезона 2026 (8 дат) |
+| `scenes/scenes_manifest.json` | М1 | да | облачность и решение по каждой найденной дате |
+| `scenes/preview/` | М1 | нет | PNG для глазной проверки облаков |
+| `zones/zones_YYYY_MM_DD.tif` | М2 | нет | маска зон, uint8: 0 вне поля, 1 сильный стресс, 2 умеренный, 3 норма; облачные пиксели поля — класс ближайшей зоны |
+| `stats/index_stats_YYYY_MM_DD.json` | М2 | нет | статистика даты, `early_stress_alert`, `indices.<NDVI\|NDRE\|MSAVI2\|NDMI>.p5…p95`, `filled_area_ha` |
+| `indices/{NDVI,NDRE,MSAVI,NDMI}_YYYY_MM_DD.tif` | М2 | нет | float32, NaN — вне поля или облако |
+| `hidden_stress/hidden_stress_YYYY_MM_DD.tif` | М2 | нет | uint8: 1 скрытый стресс, 0 нет, 255 нет данных |
+| `indices_summary.json` | М2 | нет | сводка М2 по всем датам |
+| `prescriptions/prescription_YYYY_MM_DD.geojson`, `shapefile_YYYY_MM_DD.zip`, `metrics_YYYY_MM_DD.json` | М3 | нет | карта-предписание (EPSG:4326), Shapefile для трактора (EPSG:32637), экономика |
+| `prescriptions/season_summary.json` | М3 / `main_pipeline` | нет | свод сезона, схема `vra.batch.run_series` (`area_stable`, `records`, `errors`) |
+| `overlays/{NDVI,NDRE,MSAVI,NDMI,RGB,HIDDEN}_YYYY_MM_DD.png` | М1 `s2fetch.overlays` | нет | окрашенные слои для карты М4 |
+| `overlays/meta.json` | М1 | нет | границы и шкалы слоёв (контракт ниже) |
+| `overlays/preview_all.png` | М1 | нет | контактный лист «даты × слои» |
+| `overlays/overlay_check.html` | М1 `tools/overlay_map.py` | нет | карта для проверки совмещения в браузере |
+| `field_boundary.geojson` | `main_pipeline` | нет | копия контура для М4, только если `--data-dir` не `data/` |
+| `pipeline_state.json` | `main_pipeline` | нет | sha256 сцен и масок зон, по которым считали М2 и М3 |
+| `pipeline_report.json` | `main_pipeline` | нет | отчёт последнего запуска: этапы, даты, ошибки, проверки, время |
+
+В git лежат только `samples/`, `scenes/*.tif`, `scenes/scenes_manifest.json` и этот файл (см. `.gitignore`).
+Всё остальное воспроизводится командой `python main_pipeline.py --skip-fetch` примерно за 4 с.
+
+## М1 → М2: `scenes/scene_YYYY_MM_DD.tif`
+
+- GeoTIFF float32, отражение 0..1, 10 каналов с описаниями `B02, B03, B04, B05, B06, B07, B08, B8A, B11, B12`;
+- `0` во всех каналах — вне контура поля (`nodata=0`), `NaN` во всех каналах — облако/тень внутри контура;
+- EPSG:32637, 10 м, сетка 104×104 как у `samples/sample_scene.tif`; маска поля 7960 px одна на все даты.
+
+Подробности — `src/module1/README.md`, контракт входа М2 — `src/module2/README.md`.
+
+## М1 → М4: `overlays/meta.json`
+
+PNG строятся на сетке **EPSG:3857** (Leaflet растягивает `ImageOverlay` линейно в веб-Меркаторе), около 8
+выходных пикселей на пиксель 10 м, метод nearest. Размер и экстент одни на все даты и слои. Поля, которые
+читает М4 (`src/module4/app.py`), — в его формате.
+
+| Поле | Читает М4 | Значение |
+|---|---|---|
+| `bounds` | да | `[[south, west], [north, east]]` — lat/lon углов прямоугольника EPSG:3857, одни на все PNG |
+| `index_ranges` | да | `{NDVI, NDRE, MSAVI, NDMI: [lo, hi]}` — шкала, по которой окрашены PNG; формула `season_ranges` М4: по всем `stats/index_stats_*.json` `lo=min(p5)`, `hi=max(p95)`, `pad=0.05·(hi−lo)`, `(round(lo−pad,3), round(hi+pad,3))` |
+| `field_name` | да | **не пишется**: имя поля берётся из `field_boundary.geojson` |
+| `colormaps` | нет | палитры `CMAP_VEG` (NDVI, NDRE, MSAVI) и `CMAP_WATER` (NDMI) из `app.py`: `[[доля, [r, g, b]], ...]` |
+| `alpha` | нет | 235 — альфа индексов и HIDDEN внутри поля (как `colorize` в М4); М4 добавляет `opacity=0.85` слоя |
+| `nodata_mode`, `nodata_color`, `nodata_meaning` | нет | облако/тень внутри поля: `gray` → `[128,128,128,150]` (по умолчанию) или `transparent`; вне поля всегда alpha 0 |
+| `rgb` | нет | true color B04, B03, B02, alpha 255. Растяжка одна на три канала и на сезон: `min_reflectance`/`max_reflectance` — перцентили `percentiles` (2, 98) отражения всех трёх каналов по пикселям поля всех дат (`season_dates`); `gamma` 1.3; `formula` — как считается пиксель. Превью М1 (`scenes/preview`) растягивается по-старому (0…0.18, гамма 1.6) |
+| `hidden` | нет | слой HIDDEN: 1 — цвет `[231,76,60,235]`, 0 — прозрачно, 255 в поле — `nodata_color` |
+| `schema_version`, `generated_at`, `generator` | нет | версия схемы (`1.0`), время, кто записал |
+| `render_crs`, `render_grid` | нет | `EPSG:3857`; размер PNG, шаг (м), `bounds_3857`, `oversample`, метод |
+| `source_grid` | нет | CRS, transform и размер сетки сцен |
+| `dates` | нет | даты со слоями, `YYYY_MM_DD` |
+| `layers` | нет | `{дата: {слой: имя PNG}}` |
+| `sources` | нет | `{дата: {scene, zones, indices, hidden_stress}}` — входные файлы (пути от `data/`) |
+| `inputs_sha256` | нет | отпечаток входов и параметров: если он не изменился, PNG не перерисовываются |
+
+Шкала зависит от всех дат, поэтому при новой дате перерисовываются все PNG. М4 берёт PNG вместо
+`indices/*.tif`, если есть `overlays/{INDEX}_{YYYY_MM_DD}.png` и `meta.bounds`. Слои RGB и HIDDEN М4 пока
+не показывает.
+
+## Эталоны `samples/`
+
+### sample_scene.tif
 - Каналы (10 шт.): 1:B02, 2:B03, 3:B04, 4:B05, 5:B06, 6:B07, 7:B08, 8:B8A, 9:B11, 10:B12
 - Соответствие для spyndex: B, G, R, RE1, RE2, RE3, N, N2, S1, S2
 - Тип: uint16, значения = отражение x 10000 (смещение +1000 из обработки N05.xx уже вычтено)
@@ -13,10 +82,11 @@
 - Источник: Sentinel-2 L2A, плитка T37TEN, дата 2026-08-07, облачность 0,5%
 - Размер: 104 x 104 пикселя (круг около 79 га, радиус ~500 м)
 
-## sample_zones.tif
+### sample_zones.tif
 - uint8: 0 вне поля, 1 сильный стресс, 2 умеренный, 3 норма
 - Та же сетка и CRS, что у sample_scene.tif
 - ВНИМАНИЕ: тестовая маска по терцилям NDVI (классы ~по 33%), не реальный стресс
+- `main_pipeline` передаёт её в М3 как эталон контура (`reference_mask_path`): по ней считается `coverage`
 
-## Эталоны
-Лежат в `data/samples/`. Остальные данные в git не хранятся.
+### field_boundary.geojson
+- Контур поля, EPSG:4326; по нему М1 строит сетку и маску поля, М4 рисует границу.

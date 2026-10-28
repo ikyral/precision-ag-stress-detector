@@ -23,6 +23,8 @@ def save(out_dir: Path, run: dict, entries: dict[str, dict], previous: dict) -> 
     merged.update(entries)
     doc = {**run, "scenes": [merged[d] for d in sorted(merged)]}
     p = Path(out_dir) / NAME
+    if {k: v for k, v in previous.items() if k != "generated"} == {k: v for k, v in doc.items() if k != "generated"}:
+        return p  # ничего не изменилось, кроме времени запуска: файл не трогаем
     p.parent.mkdir(parents=True, exist_ok=True)
     p.write_text(json.dumps(doc, ensure_ascii=False, indent=2, allow_nan=False) + "\n", encoding="utf-8")
     return p
