@@ -120,6 +120,56 @@ class TestCli(unittest.TestCase):
         self.assertEqual(out.stdout.strip(), "[]")
 
 
+class TestFetchUnavailable(unittest.TestCase):
+    """Без пакетов М1 или ключей CDSE: одна строка-подсказка без трейсбека, ошибка в отчёте, код 1. Без сети."""
+
+    def _run(self, modules: dict, env: dict) -> tuple[int, dict, str]:
+        from unittest import mock
+
+        import s2fetch.pipeline
+        import s2fetch.reader
+
+        tmp = Path(tempfile.mkdtemp(prefix="pas_fetch_"))
+        self.addCleanup(shutil.rmtree, tmp, ignore_errors=True)
+        out = io.StringIO()
+        with contextlib.ExitStack() as st:
+            st.enter_context(mock.patch.dict(sys.modules, modules))
+            st.enter_context(mock.patch.dict(os.environ, env))
+            st.enter_context(mock.patch.object(s2fetch.reader, "ROOT", tmp))  # .env ищется в пустой папке
+            st.enter_context(mock.patch.object(s2fetch.pipeline, "fetch_series",
+                                               side_effect=AssertionError("fetch_series вызван: сеть")))
+            # остальные этапы не нужны: код выхода и ошибки — только от М1
+            st.enter_context(mock.patch.object(mp, "stage_m2", return_value=([], set())))
+            st.enter_context(mock.patch.object(mp, "stage_m3", return_value=([], set())))
+            st.enter_context(mock.patch.object(mp, "stage_layers", return_value=None))
+            st.enter_context(mock.patch.object(mp, "run_checks", return_value=True))
+            st.enter_context(contextlib.redirect_stdout(out))
+            st.enter_context(contextlib.redirect_stderr(out))
+            code = mp.main(["--start", "2026-06-29", "--end", "2026-08-30", "--data-dir", str(tmp)])
+        return code, _json(tmp / mp.REPORT_NAME), out.getvalue()
+
+    def _check(self, code: int, rep: dict, out: str, expected: str) -> None:
+        self.assertEqual(code, 1)
+        self.assertEqual(rep["exit_code"], 1)
+        self.assertEqual(rep["errors"], {"*M1_fetch": {"stage": "M1_fetch", "error": expected}})
+        self.assertEqual(rep["stages"][0]["status"], "error")
+        self.assertNotIn("Traceback", out)
+        self.assertEqual(out.count(expected), 1, out)
+        self.assertNotIn("\n", expected)
+
+    def test_missing_m1_packages(self):
+        code, rep, out = self._run({"pystac_client": None}, {})
+        self._check(code, rep, out, f"нет модуля pystac_client. {mp.FETCH_DEPS_HINT}")
+        self.assertIn("pip install -r src/module1/requirements.txt", out)
+
+    @unittest.skipUnless(_has("pystac_client", "dotenv"), "нужны зависимости М1")
+    def test_empty_cdse_keys(self):
+        # настоящий .env не читается; пустые значения в окружении load_dotenv не перезаписывает
+        code, rep, out = self._run({}, {"CDSE_S3_ACCESS_KEY": "", "CDSE_S3_SECRET_KEY": ""})
+        self._check(code, rep, out, "В .env нет ключей: CDSE_S3_ACCESS_KEY, CDSE_S3_SECRET_KEY "
+                                    f"(см. .env.example). {mp.FETCH_KEYS_HINT}")
+
+
 @unittest.skipUnless(_has("geopandas", "vra"), "нужны зависимости М3 (geopandas)")
 class TestSeasonSummary(unittest.TestCase):
     def test_matches_run_series(self):

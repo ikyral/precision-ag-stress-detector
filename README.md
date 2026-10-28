@@ -47,6 +47,7 @@ Windows (PowerShell):
 (перекачать сцены), `--rebuild` (М2, М3 и слои по всем датам заново), нормы М3 `--rates 1=150,2=80,3=0`,
 `--base-rate 150`, `--price 45`, `--min-area 0.05`, `--nodata-mode gray|transparent`. Код выхода: 0 — ок,
 1 — ошибки обработки, 2 — данные есть, но проверки не прошли. Подробности — `docs/module1_kt3.md`.
+Если не установлены пакеты М1 (`src/module1/requirements.txt`) или в `.env` нет ключей CDSE, запуск без `--skip-fetch` выводит подсказку и завершается с кодом 1.
 
 ## Лицензия и данные
 Код: MIT. Contains modified Copernicus Sentinel data 2026.
