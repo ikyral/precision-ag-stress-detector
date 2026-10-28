@@ -45,11 +45,17 @@ try:
     import rasterio
     from rasterio.warp import Resampling, calculate_default_transform, reproject
     HAS_RASTERIO = True
+    try:  # ошибки GDAL (CPLE_*) не наследуются от RasterioError
+        from rasterio._err import CPLE_BaseError
+        RASTER_ERRORS = (rasterio.errors.RasterioError, CPLE_BaseError, ValueError, OSError)
+    except ImportError:
+        RASTER_ERRORS = (rasterio.errors.RasterioError, ValueError, OSError)
 except ImportError:  # дашборд работает и без rasterio (мок-данные в PNG)
     HAS_RASTERIO = False
 
 try:
     from PIL import Image
+    PNG_ERRORS = (OSError, ValueError, Image.DecompressionBombError)
 except ImportError:
     Image = None
 
@@ -229,7 +235,8 @@ class DataSource:
                 return p
         return None
 
-    def dates(self) -> list[str]:
+    def dates(self, quiet: bool = False) -> list[str]:
+        """Даты с данными. quiet=True — без report(): так проверяются невыбранные источники."""
         stems = [p.stem for p in (self.root / "stats").glob("index_stats_*.json")]
         for sub in VRA_SUBDIRS:
             stems += [p.stem for p in (self.root / sub).glob("metrics_*.json")]
@@ -241,7 +248,8 @@ class DataSource:
             try:
                 parse_date(m.group(1))
             except ValueError:
-                report(f"`{stem}`: некорректная дата в имени файла — файл пропущен.")
+                if not quiet:
+                    report(f"`{stem}`: некорректная дата в имени файла — файл пропущен.")
                 continue
             found.add(m.group(1))
         return sorted(found)
@@ -333,7 +341,7 @@ def load_raster(tif: Path):
     """read_geotiff_wgs84 без падения страницы: битый, недописанный или без CRS файл → (None, None)."""
     try:
         return read_geotiff_wgs84(str(tif), tif.stat().st_mtime)
-    except (rasterio.errors.RasterioError, ValueError, OSError) as e:
+    except RASTER_ERRORS as e:
         report(f"`{tif.name}` не открывается: {e}")
         return None, None
 
@@ -344,7 +352,7 @@ def index_overlay(ds: DataSource, index: str, d: str, stats, meta, vrange):
     if png is not None and meta.get("bounds") and Image is not None:
         try:
             return np.array(Image.open(png).convert("RGBA")), meta["bounds"], "png"
-        except OSError as e:
+        except PNG_ERRORS as e:
             report(f"`{png.name}` не открывается: {e}")
     if index in PNG_ONLY_LAYERS:  # RGB и HIDDEN есть только готовыми PNG (overlays/ от main_pipeline М1)
         return None, None, f"Слой {index} за {fmt_date(d)} не найден: запустите main_pipeline.py."
@@ -386,14 +394,19 @@ def season_ranges(stats_by_date: dict, meta: dict) -> dict:
     Самодостаточна (только np и константы): тест М1 test_overlays грузит её из app.py отдельно.
     """
     ranges = {k: tuple(v) for k, v in DEFAULT_RANGES.items()}
-    ranges.update({k: tuple(v) for k, v in (meta.get("index_ranges") or {}).items()})
+    meta_ranges = meta.get("index_ranges") if isinstance(meta.get("index_ranges"), dict) else {}
+    for k, v in meta_ranges.items():  # только пары конечных чисел lo < hi, иначе colorize делит на 0
+        if (isinstance(v, (list, tuple)) and len(v) == 2
+                and all(isinstance(x, (int, float)) and not isinstance(x, bool) and np.isfinite(x) for x in v)
+                and v[1] > v[0]):
+            ranges[k] = (v[0], v[1])
     for index, keys in STATS_INDEX_KEYS.items():
         lo, hi = [], []
         for s in stats_by_date.values():
             indices = s.get("indices") if isinstance(s.get("indices"), dict) else {}
             block = next((indices[k] for k in keys if isinstance(indices.get(k), dict)), {})
             p5, p95 = block.get("p5"), block.get("p95")
-            if all(isinstance(v, (int, float)) and not isinstance(v, bool) for v in (p5, p95)):
+            if all(isinstance(v, (int, float)) and not isinstance(v, bool) and np.isfinite(v) for v in (p5, p95)):
                 lo.append(p5); hi.append(p95)
         if lo and max(hi) > min(lo):
             pad = 0.05 * (max(hi) - min(lo))
@@ -612,7 +625,8 @@ def normalize_prescription(gj, rates: dict | None, name: str):
         rate = rates.get(zc, file_rate) if rates else file_rate
         area = as_number(p.get("area_ha"))
         f["properties"] = {**p, "zone_class": zc,
-                           "zone_name": p.get("zone_name") or ZONE_NAMES.get(zc, "Неизвестная зона"),
+                           # подсказка Leaflet вставляет значения как HTML
+                           "zone_name": html.escape(str(p.get("zone_name") or ZONE_NAMES.get(zc, "Неизвестная зона"))),
                            "area_ha": round(area, 2) if area is not None else "—",
                            "rate_kg_ha": round(rate, 1) if rate is not None else "—"}
         features.append(f)
@@ -717,27 +731,33 @@ def legend_html(index, vrange, meta: dict, from_png: bool) -> str:
             f'<span>{vrange[1]:.2f}</span></div>' + (legend_swatches(nodata) if nodata else ""))
 
 
-def pipeline_failures(report_doc: dict | None) -> dict[str, str]:
-    """Даты, на которых упал последний запуск main_pipeline (pipeline_report.json → errors): {YYYY_MM_DD: текст}.
+def pipeline_failures(report_doc: dict | None) -> tuple[dict[str, str], dict[str, str]]:
+    """Ошибки последнего запуска main_pipeline (pipeline_report.json → errors).
 
-    Файлы таких дат остались от прошлых запусков и могут быть устаревшими. Ключи «*этап» — ошибки всего этапа.
+    Возвращает ({YYYY_MM_DD: текст} — даты, чьи файлы остались от прошлых запусков;
+    {этап: текст} — ошибки всего этапа, ключи «*этап»).
     """
     errors = (report_doc or {}).get("errors")
     if not isinstance(errors, dict):
-        return {}
-    out = {}
+        return {}, {}
+    by_date, stages = {}, {}
     for key, err in errors.items():
-        d = str(key).replace("-", "_")
-        if d.startswith("*") or not DATE_RE.fullmatch(d):
-            continue
-        err = err if isinstance(err, dict) else {}
-        out[d] = f"{err.get('stage', 'этап ?')}: {err.get('error', 'ошибка')}"
-    return out
+        key = str(key)
+        err = err if isinstance(err, dict) else {"error": str(err)}
+        stage = str(err.get("stage") or key.lstrip("*") or "этап ?")
+        text = f"{stage}: {err.get('error', 'ошибка')}"
+        d = key.replace("-", "_")
+        if key.startswith("*"):
+            stages[stage] = text
+        elif DATE_RE.fullmatch(d):
+            by_date[d] = text
+    return by_date, stages
 
 
 def legend_range(index: str, vranges: dict, meta: dict, from_png: bool):
     """Шкала легенды: для PNG — та, по которой М1 их окрасил (meta.index_ranges), иначе — сезонная по stats."""
-    r = (meta.get("index_ranges") or {}).get(index) if from_png else None
+    ranges = meta.get("index_ranges") if isinstance(meta.get("index_ranges"), dict) else {}
+    r = ranges.get(index) if from_png else None
     if isinstance(r, (list, tuple)) and len(r) == 2 and all(as_number(v) is not None for v in r):
         return float(r[0]), float(r[1])
     return vranges.get(index)
@@ -870,7 +890,7 @@ with st.sidebar:
     st.markdown("## 🛰️ Precision Ag")
     st.caption("Космический мониторинг стресса посевов")
     names = list(sources)
-    default_src = next((i for i, n in enumerate(names) if DataSource(sources[n]).dates()), 0)
+    default_src = next((i for i, n in enumerate(names) if DataSource(sources[n]).dates(quiet=True)), 0)
     src_name = st.radio("Источник данных", names, index=default_src) if len(names) > 1 else names[0]
 
 ds = DataSource(sources[src_name])
@@ -889,7 +909,7 @@ if not field_name and field_gj and field_gj.get("features"):
     field_name = (field_gj["features"][0].get("properties") or {}).get("name")
 field_name = field_name or "Тестовое поле"
 vranges = season_ranges(stats_by_date, meta)
-failed_dates = pipeline_failures(jload(ds.root / "pipeline_report.json"))
+failed_dates, failed_stages = pipeline_failures(jload(ds.root / "pipeline_report.json"))
 
 with st.sidebar:
     st.selectbox("Поле", [field_name])
@@ -904,15 +924,20 @@ with st.sidebar:
     stats = stats_by_date.get(sel_date)
     metrics_path = ds.vra_file(f"metrics_{sel_date}.json")
     m3_metrics = jload(metrics_path)
-    if m3_metrics is not None and not isinstance(m3_metrics.get("zone_breakdown"), list):
-        report(f"`{metrics_path.name}`: нет списка zone_breakdown — экономика посчитана по данным Модуля 2.")
+    if m3_metrics is not None and not (isinstance(m3_metrics.get("zone_breakdown"), list)
+                                       and m3_metrics["zone_breakdown"]):
+        report(f"`{metrics_path.name}`: zone_breakdown отсутствует или пуст — экономика посчитана по данным Модуля 2.")
         m3_metrics = None
     metrics = m3_metrics or metrics_from_stats(stats) or {}
     clean_metrics = sanitize_metrics(metrics) if metrics.get("zone_breakdown") else None
     file_base = file_base_rate(clean_metrics or metrics)
     file_base = DEFAULT_BASE_RATE if file_base is None else file_base
     file_price = as_number(metrics.get("price_per_kg", metrics.get("price_per_unit")))
-    file_price = DEFAULT_PRICE if file_price is None or file_price < 0 else file_price
+    if file_price is None or file_price < 0:
+        if m3_metrics:
+            report(f"В `{metrics_path.name}` нет корректной цены price_per_kg — "
+                   f"принята цена по умолчанию {DEFAULT_PRICE:g} ₽/кг.")
+        file_price = DEFAULT_PRICE
 
     st.divider()
     st.markdown("**Параметры экономики**")
@@ -921,7 +946,8 @@ with st.sidebar:
     price = st.slider("Цена удобрения, ₽/кг", 0.0, max(PRICE_MAX, file_price), float(file_price), step=1.0)
     econ = recompute_economics(clean_metrics, base_rate, price) if clean_metrics else None
     downloads_match = prescription_rates_match(clean_metrics, econ) if m3_metrics and clean_metrics else False
-    stale = failed_dates.get(sel_date)
+    # упавший М2/М3 целиком: предписания всех дат могли не обновиться; сбой скачивания снимков (М1) их не трогает
+    stale = failed_dates.get(sel_date) or "; ".join(t for s, t in failed_stages.items() if s in ("M2", "M3"))
     downloads_match = downloads_match and not stale
     coverage = metrics.get("coverage") if isinstance(metrics.get("coverage"), dict) else {}
     unclassified = as_number(coverage.get("unclassified_area_ha"))
@@ -965,10 +991,13 @@ with st.sidebar:
 st.markdown(f"### {field_name}")
 mock_note = " · ⚠️ демонстрационные мок-данные" if ds.root == APP_DIR / "mock_data" else ""
 st.caption(f"Снимок Sentinel-2 L2A от {fmt_date(sel_date)} · слой: {layer_label}{mock_note}")
-if stale:
+if failed_stages:
+    st.error(f"При последнем запуске main_pipeline этап завершился ошибкой ({'; '.join(failed_stages.values())}). "
+             "Данные дат могут быть устаревшими или неполными: показаны файлы прошлых запусков.")
+if sel_date in failed_dates:
     st.error(f"Данные за {fmt_date(sel_date)} могут быть устаревшими: при последнем запуске main_pipeline "
-             f"обработка этой даты завершилась ошибкой ({stale}). Карта, статистика и предписание показаны "
-             "по файлам прошлого запуска.")
+             f"обработка этой даты завершилась ошибкой ({failed_dates[sel_date]}). Карта, статистика и "
+             "предписание показаны по файлам прошлого запуска.")
 stress_banner(stats)
 problems_box = st.container()  # заполняется в конце, когда известны все проблемы с данными
 
@@ -990,11 +1019,14 @@ if econ:
               delta_color="off")
     if metrics.get("_source") == "m2":
         st.caption("Экономика рассчитана по площадям зон из статистики Модуля 2 "
-                   "(нормы по умолчанию 100% / 53% / 0%). Данных Модуля 3 за эту дату пока нет.")
+                   "(нормы по умолчанию 100% / 53% / 0%, цена и база — из слайдеров). "
+                   "Данных Модуля 3 за эту дату пока нет.")
 else:
     for k, label in zip((k1, k2, k3, k4), ("Общая площадь поля", "Зоны стресса",
                                            "Сэкономлено удобрений", "Финансовая экономия")):
         k.metric(label, "—")
+    st.caption("Экономика не рассчитана: за эту дату нет площадей зон ни в metrics Модуля 3, "
+               "ни в index_stats Модуля 2.")
 
 # --- Карта и графики
 left, right = st.columns([3, 2], gap="medium")
