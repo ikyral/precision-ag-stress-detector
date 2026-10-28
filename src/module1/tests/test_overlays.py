@@ -337,6 +337,19 @@ class TestOverlays(unittest.TestCase):
             self.assertEqual(ov.build_overlays(data)["status"], "written")   # шкала изменилась — все PNG заново
             self.assertFalse(np.array_equal(before, read_png(png)))
 
+    def test_unreadable_scene_of_skipped_date_does_not_break_layers(self):
+        """Сцена даты, упавшей в М2 (её слои не рисуются), не читается: остальные даты рисуются, растяжка RGB — без неё."""
+        with tempfile.TemporaryDirectory() as d:
+            data = Path(d)
+            make_dataset(data)
+            (data / "scenes" / f"scene_{DATES[0]}.tif").write_bytes(b"not a tiff")
+            res = ov.build_overlays(data, dates=[DATES[1]])
+            self.assertEqual((res["status"], res["errors"], res["dates"]), ("written", {}, [DATES[1]]))
+            self.assertTrue(any(f"scene_{DATES[0]}.tif: не читается" in w for w in res["warnings"]), res["warnings"])
+            meta = json.loads((data / "overlays" / "meta.json").read_text(encoding="utf-8"))
+            self.assertEqual(meta["rgb"]["season_dates"], [DATES[1]])
+            self.assertEqual(set(meta["layers"][DATES[1]]), {*ov.INDEX_LAYERS, "RGB", "HIDDEN"})
+
     def test_transparent_mode_and_date_subset(self):
         with tempfile.TemporaryDirectory() as d:
             data = Path(d)
