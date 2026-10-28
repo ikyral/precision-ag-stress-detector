@@ -30,7 +30,7 @@ python main_pipeline.py --start 2026-06-29 --end 2026-08-30   # сначала �
 | `overlays/overlay_check.html` | М1 `tools/overlay_map.py` | нет | карта для проверки совмещения в браузере |
 | `field_boundary.geojson` | `main_pipeline` | нет | копия контура для М4, только если `--data-dir` не `data/` |
 | `pipeline_state.json` | `main_pipeline` | нет | sha256 сцен и масок зон, по которым считали М2 и М3 |
-| `pipeline_report.json` | `main_pipeline` | нет | отчёт последнего запуска: этапы, даты, ошибки, проверки, время |
+| `pipeline_report.json` | `main_pipeline` | нет | отчёт последнего запуска (схема 1.1): этапы, даты, `errors`, `warnings`, `info` (предупреждения М2, ложные по sha256, с пояснением), проверки (в т. ч. `crs_audit`: CRS и площади выходов М3 против сетки сцен), время |
 
 В git лежат только `samples/`, `scenes/*.tif`, `scenes/scenes_manifest.json` и этот файл (см. `.gitignore`).
 Всё остальное воспроизводится командой `python main_pipeline.py --skip-fetch` примерно за 4 с.

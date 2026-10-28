@@ -10,8 +10,10 @@
 даты обрабатываются. Код выхода: 0 — ок, 1 — ошибки обработки, 2 — данные есть, но проверки не прошли.
 
 Состояние <data>/pipeline_state.json: sha256 сцены, по которой М2 считал дату, и маски зон, по которой М3
-строил предписание. Если сцену подменили (например, s2fetch --force), М2 пересчитывает всю серию, а М3 —
-изменившиеся даты: process_new_scenes М2 сам такие даты не видит (zones и stats уже есть).
+строил предписание. Если сцену подменили (например, s2fetch --force) или пришла дата раньше уже обработанных,
+М2 переобрабатывает её через process_new_scenes(reprocess=[...]) — вместе с ней М2 сам пересчитывает все более
+поздние даты; М3 — изменившиеся даты. Вся серия заново — только --rebuild. Источник истины — sha256, а не mtime:
+предупреждение М2 «сцена новее результата» при совпавшем хэше уходит в info отчёта, а не в warnings.
 """
 from __future__ import annotations
 
@@ -20,6 +22,7 @@ import datetime as dt
 import hashlib
 import json
 import math
+import re
 import shutil
 import sys
 import time
@@ -37,11 +40,15 @@ for _p in ("src/module1", "src/module2", "src/module3"):
 
 STATE_NAME = "pipeline_state.json"
 REPORT_NAME = "pipeline_report.json"
-SCHEMA_VERSION = "1.0"
+SCHEMA_VERSION = "1.1"  # 1.1: info в отчёте; М2 через reprocess
 COVER_TOLERANCE_M = 10.0  # рамка предписаний строится по пикселям 10 м, контур может выступать до пикселя
 FETCH_KEYS_HINT = "Без ключей CDSE используйте --skip-fetch."
 FETCH_DEPS_HINT = ("Для скачивания нужны зависимости М1: pip install -r src/module1/requirements.txt. "
                    + FETCH_KEYS_HINT)
+# формулировки предупреждений process_new_scenes М2 (машинного кода у них нет; тест упадёт, если М2 их сменит)
+M2_SCENE_NEWER_RE = re.compile(r"^scene_(\d{4})_(\d{2})_(\d{2})\.tif: сцена новее результата ")
+M2_EARLIER_RE = re.compile(r"^даты (\d{4}-\d{2}-\d{2}(?:, \d{4}-\d{2}-\d{2})*) раньше уже обработанной "
+                           r"\d{4}-\d{2}-\d{2}: динамика более поздних дат посчитана без них")
 
 
 # ----------------------------------------------------------------------------
@@ -106,6 +113,7 @@ class Report:
             "dates": {},
             "errors": {},
             "warnings": [],
+            "info": [],
             "checks": {},
         }
 
@@ -120,6 +128,10 @@ class Report:
 
     def warn(self, message: str) -> None:
         self.doc["warnings"].append(message)
+
+    def info(self, message: str) -> None:
+        """Не проблема: пояснение к предупреждению, которое по sha256 оказалось ложным."""
+        self.doc["info"].append(message)
 
 
 # ----------------------------------------------------------------------------
@@ -169,8 +181,33 @@ def stage_fetch(args, data: Path, rep: Report) -> list[str]:
     return written
 
 
+def m2_warning_note(w: str, hashes: dict, saved: dict, asked: list[str], processed: list[str]) -> str | None:
+    """Пояснение, если предупреждение М2 ложное (тогда оно идёт в info), иначе None.
+
+    - «сцена новее результата» — по mtime; если sha256 сцены совпал с pipeline_state.json, сцена не менялась
+      (git pull/checkout, копирование);
+    - «даты … раньше уже обработанной … перезапустите всю серию» — для дат, которые мы сами передали в reprocess:
+      М2 вместе с ними пересчитал все более поздние даты, ряд точный.
+    """
+    m = M2_SCENE_NEWER_RE.match(w)
+    if m:
+        d = "-".join(m.groups())
+        if d in hashes and saved.get(d, {}).get("scene_sha256") == hashes[d]:
+            return "sha256 сцены совпал с pipeline_state.json: содержимое не менялось, новее только mtime"
+        return None
+    m = M2_EARLIER_RE.match(w)
+    if m:
+        dates = m.group(1).split(", ")
+        later = [d for d in hashes if d > min(dates)]
+        if set(dates) <= set(asked) and set(later) <= set(processed):
+            return (f"даты переданы в reprocess, М2 пересчитал и все более поздние ({len(later)}): "
+                    "ряд совпадает с полным прогоном")
+    return None
+
+
 def stage_m2(args, data: Path, state: dict, fetched: list[str], rep: Report) -> tuple[list[str], set[str]]:
-    """М2: новые даты через process_new_scenes, при подмене сцены или дате в прошлом — вся серия.
+    """М2: process_new_scenes — новые даты и reprocess (подменённые сцены и даты раньше обработанных);
+    --rebuild — вся серия через run_pipeline.
 
     Возвращает (даты, обработанные в этом запуске, даты с ошибкой М2).
     """
@@ -194,37 +231,43 @@ def stage_m2(args, data: Path, state: dict, fetched: list[str], rep: Report) -> 
                  "как есть, хэши сцен сохранены")
         for d in trusted:
             sd.setdefault(d, {})["scene_sha256"] = hashes[d]
-    changed = sorted(d for d in done if d in hashes and sd[d]["scene_sha256"] != hashes[d])
+    changed = [] if args.rebuild else sorted(d for d in done if d in hashes and sd[d]["scene_sha256"] != hashes[d])
     new = sorted(d for d in hashes if d not in done)
     late = sorted(d for d in new if done and d < max(done))
-    reason = ("--rebuild" if args.rebuild else
-              f"сцены изменились после обработки: {', '.join(changed)}" if changed else
-              f"новые даты раньше уже обработанных: {', '.join(late)}" if late else None)
-    if reason is None and new:
-        res = process_new_scenes(scenes_dir, data)
-        processed, errors = res["processed"], res["errors"]
-        if any("раньше уже обработанной" in w for w in res["warnings"]):  # страховка: М2 сам заметил
-            reason = "предупреждение М2 о дате раньше обработанной"
-        else:
-            for w in res["warnings"]:
-                rep.warn(f"M2: {w}")
-    elif reason is None:
-        processed, errors = [], {}
-    if reason is not None:
+    asked = sorted(set(changed) | set(late))
+    reprocessed: list[str] = []
+    if args.rebuild:
         summary = run_pipeline([scenes_dir], data)
         processed = sorted(d for d, r in summary["dates"].items() if d in hashes and "error" not in r)
         errors = {d: r["error"] for d, r in summary["dates"].items() if d in hashes and "error" in r}
+    elif new or asked:
+        res = process_new_scenes(scenes_dir, data, reprocess=asked or None)
+        processed, errors, reprocessed = sorted(res["processed"]), dict(res["errors"]), sorted(res["reprocessed"])
+        for w in res["warnings"]:
+            note = m2_warning_note(w, hashes, sd, asked, processed)
+            if note:
+                rep.info(f"M2: {w} [информационно: {note}]")
+            else:
+                rep.warn(f"M2: {w}")
+        lost = [d for d in asked if d not in processed and d not in errors]
+        if lost or not set(reprocessed) <= set(processed):
+            rep.error("*", "M2", f"М2 не вернул даты, переданные на переобработку: {', '.join(lost)}"
+                      if lost else f"reprocessed {reprocessed} не входят в processed {processed}")
+    else:
+        processed, errors = [], {}
     for d in processed:
         sd.setdefault(d, {})["scene_sha256"] = hashes[d]
     for d, e in errors.items():
-        sd.setdefault(d, {})["scene_sha256"] = None  # следующий запуск попробует снова
+        sd.setdefault(d, {})["scene_sha256"] = None  # следующий запуск попробует снова (через reprocess)
         rep.error(d, "M2", e)
     skipped = sorted(d for d in hashes if d not in processed and d not in errors)
     rep.stage("M2", "error" if errors else ("ok" if processed else "unchanged"), t,
-              mode="run_pipeline (вся серия)" if reason else "process_new_scenes",
-              full_rerun_reason=reason, processed=sorted(processed), skipped=skipped, errors=sorted(errors),
-              changed_scenes=changed, fetched_this_run=fetched)
-    return sorted(processed), set(errors)
+              mode="run_pipeline (вся серия, --rebuild)" if args.rebuild else "process_new_scenes",
+              full_rerun_reason="--rebuild" if args.rebuild else None, processed=processed,
+              reprocess_asked=asked, reprocessed=reprocessed, cascade=sorted(set(reprocessed) - set(asked)),
+              skipped=skipped, errors=sorted(errors), changed_scenes=changed, earlier_new_dates=late,
+              fetched_this_run=fetched)
+    return processed, set(errors)
 
 
 def stage_m3(args, data: Path, state: dict, m2_processed: list[str], m2_failed: set[str],
@@ -341,6 +384,156 @@ def _uncovered_m(outer, inner) -> float:
                (inner[2] - outer[2]) * mx, (inner[3] - outer[3]) * my)
 
 
+SHP_PARTS = (".cpg", ".dbf", ".prj", ".shp", ".shx")
+CRS84_NAMES = {"urn:ogc:def:crs:OGC:1.3:CRS84", "urn:ogc:def:crs:OGC::CRS84", "OGC:CRS84", "EPSG:4326",
+               "urn:ogc:def:crs:EPSG::4326"}
+AREA_TOLERANCE_HA = 0.01  # как допуск площади у М3 (build_season_summary area_tolerance_ha)
+
+
+def crs_audit(data: Path, ref, boundary: Path = BOUNDARY) -> dict:
+    """Сквозная проверка CRS, сеток и площадей выходов М2/М3/слоёв относительно сетки сцен ref (Grid эталона).
+
+    По каждой дате с metrics_*.json: состав Shapefile ZIP и CRS из .prj; GeoJSON в CRS84, вершины внутри контура
+    поля (допуск COVER_TOLERANCE_M), площадь в UTM = total_field_area_ha = классы 1–3 zones = field_area_ha stats
+    = Σ zone_breakdown (допуск AREA_TOLERANCE_HA); index_stats.grid и meta.source_grid — сетка эталона.
+    """
+    errs: list[str] = []
+    out = {"ok": False, "tolerance_ha": AREA_TOLERANCE_HA, "tolerance_m": COVER_TOLERANCE_M, "dates": {},
+           "errors": errs}
+    try:
+        import zipfile
+
+        import numpy as np
+        import pyogrio
+        import rasterio
+        import shapely
+        from pyproj import CRS, Transformer
+        from shapely.geometry import shape
+        from shapely.ops import unary_union
+    except ImportError as exc:
+        errs.append(f"нет модуля {exc.name}: pip install -r src/module3/requirements.txt")
+        return out
+    ref_epsg = CRS.from_user_input(ref.crs).to_epsg()
+    out["reference"] = {"crs": ref.crs, "epsg": ref_epsg, "size": [ref.width, ref.height]}
+    to_utm = Transformer.from_crs("EPSG:4326", ref.crs, always_xy=True)
+
+    def utm(g):
+        return shapely.transform(g, lambda xy: np.column_stack(to_utm.transform(xy[:, 0], xy[:, 1])))
+
+    field = utm(unary_union([shape(f["geometry"]) for f in json.loads(boundary.read_text(encoding="utf-8"))["features"]]))
+
+    def near(a, b) -> bool:
+        return a is not None and b is not None and abs(a - b) <= AREA_TOLERANCE_HA
+
+    pres, stats_dir = data / "prescriptions", data / "stats"
+    stamps = sorted({p.stem[len("metrics_"):] for p in pres.glob("metrics_*.json")}
+                    | {p.stem[len("index_stats_"):] for p in stats_dir.glob("index_stats_*.json")})
+    if not any(pres.glob("metrics_*.json")):
+        errs.append("нет prescriptions/metrics_*.json")
+    for st in stamps:
+        rec: dict = {}
+        out["dates"][st] = rec
+        bad = []
+        stats = _load_json(stats_dir / f"index_stats_{st}.json")
+        if stats is None:
+            bad.append("нет или не читается index_stats")
+        else:
+            g = stats.get("grid") or {}
+            rec["stats_grid"] = [g.get("crs_epsg"), g.get("width"), g.get("height")]
+            if rec["stats_grid"] != [ref_epsg, ref.width, ref.height]:
+                bad.append(f"index_stats.grid {rec['stats_grid']} ≠ эталон [{ref_epsg}, {ref.width}, {ref.height}]")
+            rec["area_stats_ha"] = stats.get("field_area_ha")
+        metrics = _load_json(pres / f"metrics_{st}.json")
+        if metrics is not None:
+            try:
+                total = rec["area_metrics_ha"] = metrics["total_field_area_ha"]
+                rec["area_zone_breakdown_ha"] = math.fsum(z["area_ha"] for z in metrics["zone_breakdown"])
+                files = metrics.get("files") or {}
+                # Shapefile ZIP: состав и CRS из .prj
+                zpath = pres / files.get("shapefile_zip", f"shapefile_{st}.zip")
+                with zipfile.ZipFile(zpath) as zf:
+                    names = sorted(zf.namelist())
+                    stems = {Path(n).stem for n in names}
+                    rec["shp_parts"] = sorted(Path(n).suffix.lower() for n in names)
+                    if tuple(rec["shp_parts"]) != SHP_PARTS or len(stems) != 1 or any("/" in n for n in names):
+                        bad.append(f"{zpath.name}: состав {names}, нужно {'/'.join(SHP_PARTS)} с одним именем")
+                    prj = next((n for n in names if n.lower().endswith(".prj")), None)
+                    rec["shp_epsg"] = CRS.from_wkt(zf.read(prj).decode("utf-8", "replace")).to_epsg() if prj else None
+                if rec["shp_epsg"] != ref_epsg:
+                    bad.append(f"{zpath.name}: CRS .prj EPSG:{rec['shp_epsg']}, сетка сцен EPSG:{ref_epsg}")
+                shp = next((n for n in names if n.lower().endswith(".shp")), None)
+                if shp:
+                    gdf = pyogrio.read_dataframe(f"/vsizip/{zpath}/{shp}")
+                    rec["area_shp_ha"] = float(gdf.geometry.area.sum() / 10_000) if rec["shp_epsg"] == ref_epsg else None
+                    rec["shp_features"] = len(gdf)
+                # GeoJSON: CRS84, внутри контура, площадь в UTM
+                gj = json.loads((pres / files.get("geojson", f"prescription_{st}.geojson")).read_text(encoding="utf-8"))
+                crs_name = ((gj.get("crs") or {}).get("properties") or {}).get("name")
+                rec["geojson_crs"] = crs_name or "CRS84 (RFC 7946, без члена crs)"
+                if crs_name and crs_name not in CRS84_NAMES:
+                    bad.append(f"GeoJSON: crs {crs_name}, нужен CRS84")
+                geoms = [shape(f["geometry"]) for f in gj["features"]]
+                xy = np.concatenate([shapely.get_coordinates(g) for g in geoms]) if geoms else np.zeros((0, 2))
+                if not len(xy) or np.abs(xy[:, 0]).max() > 180 or np.abs(xy[:, 1]).max() > 90:
+                    bad.append("GeoJSON: нет координат или они не lon/lat")
+                else:
+                    ug = [utm(g) for g in geoms]
+                    rec["area_geojson_ha"] = math.fsum(g.area for g in ug) / 10_000
+                    pts = shapely.points(np.concatenate([shapely.get_coordinates(g) for g in ug]))
+                    rec["geojson_max_outside_m"] = round(float(shapely.distance(pts, field).max()), 2)
+                    if rec["geojson_max_outside_m"] > COVER_TOLERANCE_M:
+                        bad.append(f"GeoJSON: вершины за контуром поля на {rec['geojson_max_outside_m']} м "
+                                   f"(допуск {COVER_TOLERANCE_M:g} м)")
+                # zones: классы 1–3
+                zp = data / "zones" / f"zones_{st}.tif"
+                if zp.exists():
+                    with rasterio.open(zp) as z:
+                        band = z.read(1)
+                        rec["area_zones_ha"] = float(((band >= 1) & (band <= 3)).sum()
+                                                     * abs(z.transform.a * z.transform.e) / 10_000)
+                for key, label in (("area_geojson_ha", "GeoJSON в UTM"), ("area_shp_ha", "Shapefile"),
+                                   ("area_zone_breakdown_ha", "Σ zone_breakdown"), ("area_zones_ha", "классы 1–3 zones"),
+                                   ("area_stats_ha", "field_area_ha stats М2")):
+                    if not near(rec.get(key), total):
+                        bad.append(f"площадь: {label} {rec.get(key)} га ≠ total_field_area_ha {total} га "
+                                   f"(допуск {AREA_TOLERANCE_HA} га)")
+            except Exception as exc:  # noqa: BLE001 — битый файл даты: в нарушения, не падаем
+                bad.append(f"не читается ({type(exc).__name__}: {exc})")
+        for k in [k for k in rec if k.startswith("area_") and isinstance(rec[k], float)]:
+            rec[k] = round(rec[k], 6)
+        errs += [f"{st}: {b}" for b in bad]
+    meta = _load_json(data / "overlays" / "meta.json")
+    sg = (meta or {}).get("source_grid")
+    if not sg:
+        errs.append("overlays/meta.json: нет source_grid")
+    else:
+        same = (CRS.from_user_input(sg["crs"]) == CRS.from_user_input(ref.crs) and sg["size"] == [ref.width, ref.height]
+                and all(abs(a - b) < 1e-6 for a, b in zip(sg["transform"], list(ref.transform)[:6])))
+        out["meta_source_grid"] = "совпадает с сеткой сцен" if same else sg
+        if not same:
+            errs.append(f"overlays/meta.json: source_grid {sg} ≠ сетка сцен {ref.crs} {list(ref.transform)[:6]} "
+                        f"{[ref.width, ref.height]}")
+    per = out["dates"].values()
+    out["summary"] = {
+        "dates": len([r for r in per if "area_metrics_ha" in r]),
+        "shp_epsg": sorted({r["shp_epsg"] for r in per if r.get("shp_epsg") is not None}),
+        "geojson_max_outside_m": max((r["geojson_max_outside_m"] for r in per if "geojson_max_outside_m" in r),
+                                     default=None),
+        "area_ha": sorted({round(r["area_metrics_ha"], 2) for r in per if "area_metrics_ha" in r}),
+    }
+    out["ok"] = not errs
+    return out
+
+
+def crs_audit_line(a: dict) -> str:
+    s = a.get("summary") or {}
+    head = (f"crs_audit: {'ok' if a['ok'] else 'НАРУШЕНИЯ ' + str(len(a['errors']))}, дат {s.get('dates', 0)}, "
+            f"SHP EPSG:{'/'.join(map(str, s.get('shp_epsg') or ['?']))}, GeoJSON CRS84, "
+            f"вершины за контуром ≤ {s.get('geojson_max_outside_m')} м (допуск {a['tolerance_m']:g}), "
+            f"площадь {', '.join(f'{x:.2f}' for x in s.get('area_ha') or [])} га (допуск {a['tolerance_ha']})")
+    return head + (f"; первое: {a['errors'][0]}" if a["errors"] else "")
+
+
 def run_checks(data: Path, layers: dict | None, rep: Report) -> bool:
     from s2fetch.grid import compare_grids, grid_of_file
     from stress_core.contract import check_outputs
@@ -403,6 +596,7 @@ def run_checks(data: Path, layers: dict | None, rep: Report) -> bool:
         errs.append("нет overlays/meta.json с bounds")
     cover.update(ok=not errs, errors=errs)
     checks["coverage"] = cover
+    checks["crs_audit"] = crs_audit(data, ref)
 
     ok = all(c["ok"] for c in checks.values())
     rep.stage("checks", "ok" if ok else "failed", t,
@@ -483,13 +677,17 @@ def main(argv=None) -> int:
 
     print(f"\nmain_pipeline: {data}")
     for st in d["stages"]:  # текст ошибки этапа — ниже, в строке ОШИБКА
-        extra = {k: st[k] for k in ("processed", "written", "errors", "full_rerun_reason", "png_count", "failed")
-                 if st.get(k)}
+        extra = {k: st[k] for k in ("processed", "reprocessed", "written", "errors", "full_rerun_reason", "png_count",
+                                    "failed") if st.get(k)}
         print(f"  {st['name']:9} {st['status']:9} {st['seconds']:7.2f} c  {extra if extra else ''}")
     for w in d["warnings"]:
         print("  предупреждение:", w)
+    if d["info"]:
+        print(f"  инфо: {len(d['info'])} (ложные предупреждения М2, пояснения в {REPORT_NAME} -> info)")
     for k, e in d["errors"].items():
         print(f"  ОШИБКА {k} [{e['stage']}]: {e['error']}")
+    if "crs_audit" in d["checks"]:
+        print("  " + crs_audit_line(d["checks"]["crs_audit"]))
     print(f"  проверки: {'ok' if checks_ok else 'НЕ ПРОЙДЕНЫ'}; отчёт {data / REPORT_NAME}; "
           f"{d['seconds']:.1f} c; код выхода {code}")
     return code

@@ -369,7 +369,18 @@ def build_overlays(data_dir: str | Path, *, dates: list[str] | None = None, over
                 "bounds": old["bounds"], "errors": errors, "warnings": warnings, "meta": str(meta_path)}
 
     ranges = season_ranges([doc for _, doc in stats_all.values()])
-    stretch = rgb_stretch(_read(p, None)[0] for p in season_scenes)
+    stretch_scenes: list[Path] = []          # прочитанные сцены сезона: битая сцена одной даты не валит все слои
+
+    def season_arrays():
+        for p in season_scenes:
+            try:
+                arr = _read(p, None)[0]
+            except Exception as exc:  # noqa: BLE001
+                warnings.append(f"{p.name}: не читается ({type(exc).__name__}), растяжка RGB — без этой сцены")
+                continue
+            stretch_scenes.append(p)
+            yield arr
+    stretch = rgb_stretch(season_arrays())
     grid: Grid | None = None
     rg = lookup = None
     layers: dict[str, dict[str, str]] = {}
@@ -446,7 +457,7 @@ def build_overlays(data_dir: str | Path, *, dates: list[str] | None = None, over
         "rgb": {"bands": list(RGB_BANDS), "stretch": "percentile", "percentiles": list(RGB_PERCENTILES),
                 "pooled": "одна шкала на три канала: перцентили отражения B04, B03, B02 вместе по всем пикселям "
                           "поля всех дат сезона (сцены дат со stats)",
-                "season_dates": sorted(p.stem[len("scene_"):] for p in season_scenes), "min_reflectance": stretch[0], "max_reflectance": stretch[1],
+                "season_dates": sorted(p.stem[len("scene_"):] for p in stretch_scenes), "min_reflectance": stretch[0], "max_reflectance": stretch[1],
                 "gamma": RGB_GAMMA, "alpha": RGB_ALPHA,
                 "formula": "255 * clip((refl - min_reflectance) / (max_reflectance - min_reflectance), 0, 1) "
                            "** (1 / gamma)",
