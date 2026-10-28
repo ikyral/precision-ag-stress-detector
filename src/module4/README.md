@@ -54,8 +54,16 @@ streamlit run app.py
 Если есть `overlays/{INDEX}_YYYY_MM_DD.png` и `overlays/meta.json` с `bounds`, слой берётся из PNG
 (раньше tif М2). Слои RGB («Снимок Sentinel-2») и HIDDEN («Скрытый стресс М2») есть только в PNG.
 PNG накладываются с непрозрачностью 1 (альфа уже в картинке), tif — 0.85. Шкала легенды PNG-слоя
-берётся из `meta.index_ranges`; цвета «нет данных» (облака, тени) и HIDDEN — из
-`meta.nodata_color` и `meta.hidden`.
+берётся из `meta.index_ranges`. Подписи и цвета легенды — из схемы 1.1: `nodata_label`/`nodata_css`,
+`hidden.label`/`hidden.css`, `rgb.legend_text`; для схемы 1.0 — из `nodata_color`, `hidden.color` и
+подписей по умолчанию. Если PNG за дату нет, а `meta.json` есть, под картой пишется, что слой построен по
+`indices/*.tif`.
+
+## Даты с ошибкой последнего запуска
+
+Если в `pipeline_report.json` у даты есть ошибка (`errors["YYYY-MM-DD"]`), её файлы остались от прошлого
+запуска. Дата не прячется, но над картой выводится красный баннер с этапом и текстом ошибки, а скачивание
+предписания за неё отключается.
 
 ## Стыковка с M3: сезон 2026
 

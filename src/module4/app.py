@@ -86,9 +86,11 @@ CMAP_WATER = [(0.0, (140, 81, 10)), (0.25, (216, 179, 101)), (0.5, (246, 232, 19
               (0.75, (90, 180, 172)), (1.0, (1, 102, 94))]
 INDEX_CMAPS = {"NDVI": CMAP_VEG, "NDRE": CMAP_VEG, "MSAVI": CMAP_VEG, "NDMI": CMAP_WATER}
 PNG_ONLY_LAYERS = {"RGB": "Sentinel-2 L2A, true color (B04, B03, B02)",  # есть только готовыми PNG М1
-                   "HIDDEN": "Скрытый стресс: NDRE падает раньше NDVI"}
+                   "HIDDEN": "Скрытый стресс (М2)"}  # подписи по умолчанию; схема 1.1 meta.json задаёт свои
 DEFAULT_NODATA_COLOR = (128, 128, 128, 150)  # облака и тени в PNG М1 (meta.nodata_color)
+DEFAULT_NODATA_LABEL = "Нет данных (облако/тень)"
 DEFAULT_HIDDEN_COLOR = (231, 76, 60, 235)
+CSS_RGBA_RE = re.compile(r"rgba\(\s*\d{1,3}\s*,\s*\d{1,3}\s*,\s*\d{1,3}\s*,\s*(0|1|0?\.\d+|1\.0+)\s*\)")
 INDEX_SERIES = [("mean_ndvi", "NDVI", "#27ae60"), ("mean_ndre", "NDRE", "#c0392b"),
                 ("mean_msavi", "MSAVI", "#8d6e3f"), ("mean_ndmi", "NDMI", "#2980b9")]
 
@@ -670,23 +672,55 @@ def legend_swatches(items) -> str:
     return f'<div class="pas-legend">{spans}</div>'
 
 
+def meta_css(css, rgba, default) -> str:
+    """CSS-цвет легенды из meta.json 1.1 (*_css), если он вида rgba(...); иначе из [r, g, b, a] схемы 1.0."""
+    if isinstance(css, str) and CSS_RGBA_RE.fullmatch(css.strip()):
+        return css.strip()
+    return css_rgba(meta_rgba(rgba, default))
+
+
+def meta_label(value, default: str) -> str:
+    return value.strip() if isinstance(value, str) and value.strip() else default
+
+
 def legend_html(index, vrange, meta: dict, from_png: bool) -> str:
-    """Легенда слоя. Для PNG М1 добавляется пункт «нет данных» (облака, тени), если они закрашены."""
+    """Легенда слоя. Подписи и цвета PNG М1 — из meta.json (схема 1.1), с запасными для схемы 1.0."""
     if index is None:
         return legend_swatches((ZONE_COLORS[z], ZONE_SHORT[z]) for z in (1, 2, 3))
     nodata = []
     if from_png and meta.get("nodata_mode", "gray") != "transparent":
-        nodata = [(css_rgba(meta_rgba(meta.get("nodata_color"), DEFAULT_NODATA_COLOR)), "Нет данных (облака, тени)")]
+        nodata = [(meta_css(meta.get("nodata_css"), meta.get("nodata_color"), DEFAULT_NODATA_COLOR),
+                   meta_label(meta.get("nodata_label"), DEFAULT_NODATA_LABEL))]
     if index == "RGB":
-        return f'<div class="pas-legend"><span>{PNG_ONLY_LAYERS["RGB"]}</span></div>'
+        rgb = meta.get("rgb") if isinstance(meta.get("rgb"), dict) else {}
+        text = meta_label(rgb.get("legend_text"), PNG_ONLY_LAYERS["RGB"])
+        return f'<div class="pas-legend"><span>{html.escape(text)}</span></div>'
     if index == "HIDDEN":
         hidden = meta.get("hidden") if isinstance(meta.get("hidden"), dict) else {}
-        color = meta_rgba(hidden.get("1", hidden.get("color")), DEFAULT_HIDDEN_COLOR)
-        return legend_swatches([(css_rgba(color), PNG_ONLY_LAYERS["HIDDEN"])] + nodata)
+        color = meta_css(hidden.get("css"), hidden.get("1", hidden.get("color")), DEFAULT_HIDDEN_COLOR)
+        return legend_swatches([(color, meta_label(hidden.get("label"), PNG_ONLY_LAYERS["HIDDEN"]))] + nodata)
     grad = ", ".join(f"rgb({c[0]},{c[1]},{c[2]}) {s * 100:.0f}%" for s, c in INDEX_CMAPS[index])
     return (f'<div class="pas-bar" style="background: linear-gradient(90deg, {grad});"></div>'
             f'<div class="pas-bar-labels"><span>{vrange[0]:.2f}</span><span>{index}</span>'
             f'<span>{vrange[1]:.2f}</span></div>' + (legend_swatches(nodata) if nodata else ""))
+
+
+def pipeline_failures(report_doc: dict | None) -> dict[str, str]:
+    """Даты, на которых упал последний запуск main_pipeline (pipeline_report.json → errors): {YYYY_MM_DD: текст}.
+
+    Файлы таких дат остались от прошлых запусков и могут быть устаревшими. Ключи «*этап» — ошибки всего этапа.
+    """
+    errors = (report_doc or {}).get("errors")
+    if not isinstance(errors, dict):
+        return {}
+    out = {}
+    for key, err in errors.items():
+        d = str(key).replace("-", "_")
+        if d.startswith("*") or not DATE_RE.fullmatch(d):
+            continue
+        err = err if isinstance(err, dict) else {}
+        out[d] = f"{err.get('stage', 'этап ?')}: {err.get('error', 'ошибка')}"
+    return out
 
 
 def legend_range(index: str, vranges: dict, meta: dict, from_png: bool):
@@ -834,6 +868,7 @@ if not field_name and field_gj and field_gj.get("features"):
     field_name = (field_gj["features"][0].get("properties") or {}).get("name")
 field_name = field_name or "Тестовое поле"
 vranges = season_ranges(stats_by_date, meta)
+failed_dates = pipeline_failures(jload(ds.root / "pipeline_report.json"))
 
 with st.sidebar:
     st.selectbox("Поле", [field_name])
@@ -865,6 +900,8 @@ with st.sidebar:
     price = st.slider("Цена удобрения, ₽/кг", 0.0, max(PRICE_MAX, file_price), float(file_price), step=1.0)
     econ = recompute_economics(clean_metrics, base_rate, price) if clean_metrics else None
     downloads_match = prescription_rates_match(clean_metrics, econ) if m3_metrics and clean_metrics else False
+    stale = failed_dates.get(sel_date)
+    downloads_match = downloads_match and not stale
     coverage = metrics.get("coverage") if isinstance(metrics.get("coverage"), dict) else {}
     unclassified = as_number(coverage.get("unclassified_area_ha"))
     if coverage.get("is_complete", True) is False and unclassified is not None:
@@ -896,6 +933,8 @@ with st.sidebar:
         st.caption("Файлы-задания появятся, когда Модуль 3 сформирует предписание за эту дату.")
     elif not m3_metrics:
         st.caption("Скачивание отключено: нет metrics_*.json Модуля 3 за эту дату, нормы файлов не проверить.")
+    elif stale:
+        st.caption("Скачивание отключено: файлы за эту дату остались от прошлого запуска и могут быть устаревшими.")
     elif not downloads_match:
         st.warning("Нормы на экране отличаются от сохранённых файлов. Верните исходную норму "
                    "или создайте новое предписание в М3; скачивание текущих файлов отключено.")
@@ -905,6 +944,10 @@ with st.sidebar:
 st.markdown(f"### {field_name}")
 mock_note = " · ⚠️ демонстрационные мок-данные" if ds.root == APP_DIR / "mock_data" else ""
 st.caption(f"Снимок Sentinel-2 L2A от {fmt_date(sel_date)} · слой: {layer_label}{mock_note}")
+if stale:
+    st.error(f"Данные за {fmt_date(sel_date)} могут быть устаревшими: при последнем запуске main_pipeline "
+             f"обработка этой даты завершилась ошибкой ({stale}). Карта, статистика и предписание показаны "
+             "по файлам прошлого запуска.")
 stress_banner(stats)
 problems_box = st.container()  # заполняется в конце, когда известны все проблемы с данными
 
@@ -946,6 +989,8 @@ with left:
         if rgba is None:
             st.info(info)
         from_png = info == "png"
+        if info == "tif" and meta.get("bounds"):
+            st.caption("PNG Модуля 1 за эту дату нет: слой построен по растру Модуля 2 (indices/*.tif).")
     elif not presc:
         rgba, rbounds = zones_overlay(ds, sel_date, stats)
         if rgba is not None:
