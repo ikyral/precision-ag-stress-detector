@@ -39,6 +39,9 @@ STATE_NAME = "pipeline_state.json"
 REPORT_NAME = "pipeline_report.json"
 SCHEMA_VERSION = "1.0"
 COVER_TOLERANCE_M = 10.0  # рамка предписаний строится по пикселям 10 м, контур может выступать до пикселя
+FETCH_KEYS_HINT = "Без ключей CDSE используйте --skip-fetch."
+FETCH_DEPS_HINT = ("Для скачивания нужны зависимости М1: pip install -r src/module1/requirements.txt. "
+                   + FETCH_KEYS_HINT)
 
 
 # ----------------------------------------------------------------------------
@@ -128,16 +131,24 @@ def stage_fetch(args, data: Path, rep: Report) -> list[str]:
     if args.skip_fetch:
         rep.stage("M1_fetch", "skipped", t, reason="--skip-fetch")
         return []
-    from s2fetch.manual import DEFAULT_PATH as manual_masks
-    from s2fetch.pipeline import Options, fetch_series
-
-    opt = Options(BOUNDARY, args.start, args.end, data / "scenes", max_cloud=args.max_cloud,
-                  weekly=args.weekly, force=args.force, reference=REF_SCENE, manual_masks=manual_masks)
     try:
+        # зависимости и ключи М1 — до сети: s2fetch грузит pystac_client лениво, а ключи читает после поиска
+        import pystac_client  # noqa: F401
+        from s2fetch.manual import DEFAULT_PATH as manual_masks
+        from s2fetch.pipeline import Options, fetch_series
+        from s2fetch.reader import configure_s3
+
+        configure_s3()
+        opt = Options(BOUNDARY, args.start, args.end, data / "scenes", max_cloud=args.max_cloud,
+                      weekly=args.weekly, force=args.force, reference=REF_SCENE, manual_masks=manual_masks)
         code, results = fetch_series(opt)
-    except SystemExit as exc:  # нет ключей в .env и т. п.
-        rep.stage("M1_fetch", "error", t, error=str(exc))
-        rep.error("*", "M1_fetch", str(exc))
+    except (ImportError, SystemExit) as exc:  # без трейсбека: одна строка с подсказкой
+        if isinstance(exc, ImportError):
+            msg = f"{f'нет модуля {exc.name}' if exc.name else exc}. {FETCH_DEPS_HINT}"
+        else:
+            msg = f"{exc}. {FETCH_KEYS_HINT}"
+        rep.stage("M1_fetch", "error", t, error=msg)
+        rep.error("*", "M1_fetch", msg)
         return []
     except Exception as exc:  # noqa: BLE001 — нет сети: работаем с тем, что уже скачано
         traceback.print_exc()
@@ -514,9 +525,8 @@ def main(argv=None) -> int:
     _write_json(data / REPORT_NAME, d)
 
     print(f"\nmain_pipeline: {data}")
-    for st in d["stages"]:
-        extra = {k: st[k] for k in ("processed", "written", "errors", "full_rerun_reason", "png_count", "failed",
-                                    "error")
+    for st in d["stages"]:  # текст ошибки этапа — ниже, в строке ОШИБКА
+        extra = {k: st[k] for k in ("processed", "written", "errors", "full_rerun_reason", "png_count", "failed")
                  if st.get(k)}
         print(f"  {st['name']:9} {st['status']:9} {st['seconds']:7.2f} c  {extra if extra else ''}")
     for w in d["warnings"]:
