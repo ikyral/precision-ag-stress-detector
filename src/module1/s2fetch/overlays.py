@@ -1,7 +1,8 @@
 """Окрашенные PNG-оверлеи для кабинета М4: data/overlays/{слой}_YYYY_MM_DD.png + meta.json.
 
 Слои: NDVI, NDRE, MSAVI, NDMI — из растров индексов М2 (indices/*.tif, сами индексы не пересчитываются);
-RGB — true color из сцен М1 (своя растяжка по перцентилям поля, не как у превью КТ2); HIDDEN — маска скрытого стресса М2 (hidden_stress/*.tif, М4 её пока не показывает).
+RGB — true color из сцен М1 (своя растяжка по перцентилям поля, не как у превью КТ2); HIDDEN — маска скрытого стресса М2 (hidden_stress/*.tif).
+Подписи и CSS-цвета легенды М4 — в meta.json (hidden.label/css, nodata_label/css, rgb.label/legend_text).
 
 Геометрия: Leaflet растягивает ImageOverlay линейно в EPSG:3857, поэтому PNG строится на сетке EPSG:3857
 (прямоугольник вокруг сетки сцен, ~oversample выходных пикселей на пиксель 10 м), а meta.bounds — lat/lon углов
@@ -31,7 +32,7 @@ from affine import Affine
 
 from .grid import Grid, compare_grids, grid_of_file
 
-SCHEMA_VERSION = "1.0"
+SCHEMA_VERSION = "1.1"                       # 1.1: подписи и CSS-цвета для легенды М4 (только добавления)
 RENDER_CRS = "EPSG:3857"
 OVERSAMPLE = 8
 INDEX_LAYERS = ("NDVI", "NDRE", "MSAVI", "NDMI")
@@ -51,6 +52,11 @@ NODATA_GRAY = (128, 128, 128, 150)           # внутри поля нет на
 NODATA_MEANING = ("внутри контура поля нет наблюдения: облако/тень (NaN в индексе или сцене) или 255 в "
                   "hidden_stress; не прозрачно, чтобы сквозь дыру не была видна подложка другой даты")
 HIDDEN_COLOR = (231, 76, 60, ALPHA)          # 1 = скрытый стресс; 0 = прозрачно
+# подписи легенды М4 (meta.json): короткие, рядом с цветами, которыми красятся PNG
+NODATA_LABEL = "Нет данных (облако/тень)"
+HIDDEN_LABEL = "Скрытый стресс (М2)"
+RGB_LABEL = "Снимок Sentinel-2 (RGB)"
+RGB_LEGEND_TEXT = "Sentinel-2 L2A, true color (B04, B03, B02)"
 
 # RGB: снимок, а не тепловая карта — непрозрачный, растяжка по полю, одна на сезон и на три канала
 # (по каналам цвета уходят в пурпур: синий канал в поле узкий). Гамма 1.3 вытягивает тени.
@@ -152,6 +158,12 @@ def colorize(arr: np.ndarray, vmin: float, vmax: float, cmap) -> np.ndarray:
     rgb = np.stack([np.interp(t, stops, cols[:, k]) for k in range(3)], axis=-1)
     alpha = np.where(valid, ALPHA, 0)[..., None]
     return np.concatenate([rgb, alpha], axis=-1).astype(np.uint8)
+
+
+def css_rgba(rgba) -> str:
+    """(r, g, b, a 0..255) -> CSS 'rgba(r, g, b, a/255)' с 3 знаками альфы; цвет пикселя PNG без opacity слоя."""
+    r, g, b, a = (int(v) for v in rgba)
+    return f"rgba({r}, {g}, {b}, {round(a / 255, 3):g})"
 
 
 def season_ranges(stats_docs) -> dict[str, tuple[float, float]]:
@@ -344,7 +356,8 @@ def build_overlays(data_dir: str | Path, *, dates: list[str] | None = None, over
             if p is not None:
                 inputs[_rel(p, data)] = p
     params = {"schema_version": SCHEMA_VERSION, "oversample": oversample, "nodata_mode": nodata_mode,
-              "hidden": hidden, "dates": sorted(plan), "rgb": [RGB_BANDS, RGB_PERCENTILES, RGB_GAMMA, RGB_ALPHA], "alpha": ALPHA}
+              "hidden": hidden, "dates": sorted(plan), "rgb": [RGB_BANDS, RGB_PERCENTILES, RGB_GAMMA, RGB_ALPHA], "alpha": ALPHA,
+              "labels": [NODATA_LABEL, HIDDEN_LABEL, RGB_LABEL, RGB_LEGEND_TEXT]}
     fp = hashlib.sha256(json.dumps({"params": params, "inputs": {k: _sha256(p) for k, p in sorted(inputs.items())}},
                                    sort_keys=True).encode()).hexdigest()
     meta_path = out / "meta.json"
@@ -356,7 +369,18 @@ def build_overlays(data_dir: str | Path, *, dates: list[str] | None = None, over
                 "bounds": old["bounds"], "errors": errors, "warnings": warnings, "meta": str(meta_path)}
 
     ranges = season_ranges([doc for _, doc in stats_all.values()])
-    stretch = rgb_stretch(_read(p, None)[0] for p in season_scenes)
+    stretch_scenes: list[Path] = []          # прочитанные сцены сезона: битая сцена одной даты не валит все слои
+
+    def season_arrays():
+        for p in season_scenes:
+            try:
+                arr = _read(p, None)[0]
+            except Exception as exc:  # noqa: BLE001
+                warnings.append(f"{p.name}: не читается ({type(exc).__name__}), растяжка RGB — без этой сцены")
+                continue
+            stretch_scenes.append(p)
+            yield arr
+    stretch = rgb_stretch(season_arrays())
     grid: Grid | None = None
     rg = lookup = None
     layers: dict[str, dict[str, str]] = {}
@@ -433,15 +457,19 @@ def build_overlays(data_dir: str | Path, *, dates: list[str] | None = None, over
         "rgb": {"bands": list(RGB_BANDS), "stretch": "percentile", "percentiles": list(RGB_PERCENTILES),
                 "pooled": "одна шкала на три канала: перцентили отражения B04, B03, B02 вместе по всем пикселям "
                           "поля всех дат сезона (сцены дат со stats)",
-                "season_dates": sorted(p.stem[len("scene_"):] for p in season_scenes), "min_reflectance": stretch[0], "max_reflectance": stretch[1],
+                "season_dates": sorted(p.stem[len("scene_"):] for p in stretch_scenes), "min_reflectance": stretch[0], "max_reflectance": stretch[1],
                 "gamma": RGB_GAMMA, "alpha": RGB_ALPHA,
                 "formula": "255 * clip((refl - min_reflectance) / (max_reflectance - min_reflectance), 0, 1) "
-                           "** (1 / gamma)"} if stretch else None,
-        "hidden": {"color": list(HIDDEN_COLOR), "values": "1 — цвет, 0 — прозрачно, 255 в поле — nodata"}
+                           "** (1 / gamma)",
+                "label": RGB_LABEL, "legend_text": RGB_LEGEND_TEXT} if stretch else None,
+        "hidden": {"color": list(HIDDEN_COLOR), "values": "1 — цвет, 0 — прозрачно, 255 в поле — nodata",
+                   "label": HIDDEN_LABEL, "css": css_rgba(HIDDEN_COLOR)}
                   if hidden else None,
         "outside_field": "прозрачно (alpha 0)",
         "nodata_mode": nodata_mode,
         "nodata_color": list(nodata_rgba) if nodata_rgba else [0, 0, 0, 0],
+        "nodata_css": css_rgba(nodata_rgba or (0, 0, 0, 0)),
+        "nodata_label": NODATA_LABEL,
         "nodata_meaning": NODATA_MEANING,
         "dates": sorted(layers),
         "layers": layers,

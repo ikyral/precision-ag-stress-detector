@@ -180,6 +180,39 @@ class TestOverlays(unittest.TestCase):
         self.assertEqual(set(m["layers"]["2026_08_07"]), {*ov.INDEX_LAYERS, "RGB", "HIDDEN"})
         self.assertTrue((self.data / "overlays" / "preview_all.png").exists())
 
+    def test_legend_labels_and_css_match_png(self):
+        """Подписи и CSS легенды М4: цвета в meta — те же, что в пикселях PNG; старые поля не тронуты."""
+        import re
+
+        m = self.meta
+        self.assertEqual(m["schema_version"], "1.1")
+        self.assertEqual(m["hidden"]["label"], "Скрытый стресс (М2)")
+        self.assertEqual(m["rgb"]["label"], "Снимок Sentinel-2 (RGB)")
+        self.assertEqual(m["rgb"]["legend_text"], "Sentinel-2 L2A, true color (B04, B03, B02)")
+        self.assertTrue(m["nodata_label"] and len(m["nodata_label"]) < 40)
+        self.assertTrue(len(m["nodata_meaning"]) > len(m["nodata_label"]))
+        for key in ("bounds", "index_ranges", "colormaps", "alpha", "nodata_mode", "nodata_color", "nodata_meaning",
+                    "dates", "layers", "sources", "inputs_sha256"):
+            self.assertIn(key, m)
+        self.assertLessEqual({"color", "values"}, set(m["hidden"]))
+
+        def parse(css):
+            g = re.fullmatch(r"rgba\((\d+), (\d+), (\d+), ([0-9.]+)\)", css)
+            self.assertIsNotNone(g, css)
+            return [int(g[1]), int(g[2]), int(g[3])], float(g[4])
+
+        # пиксели PNG: скрытый стресс и облако внутри поля
+        hidden_px = list(self._at("HIDDEN", DATES[0], *PEAK))
+        cloud_px = list(self._at("NDVI", DATES[0], CLOUD[0].start + 2, CLOUD[1].start + 2))
+        for px, color, css in ((hidden_px, m["hidden"]["color"], m["hidden"]["css"]),
+                               (cloud_px, m["nodata_color"], m["nodata_css"])):
+            self.assertEqual(px, color)
+            rgb, a = parse(css)
+            self.assertEqual(rgb, color[:3])
+            self.assertAlmostEqual(a, color[3] / 255, delta=0.0005)
+        self.assertEqual(m["hidden"]["css"], "rgba(231, 76, 60, 0.922)")
+        self.assertEqual(m["nodata_css"], "rgba(128, 128, 128, 0.588)")
+
     def test_bounds_match_manual_corners(self):
         from pyproj import Transformer
 
@@ -304,6 +337,19 @@ class TestOverlays(unittest.TestCase):
             self.assertEqual(ov.build_overlays(data)["status"], "written")   # шкала изменилась — все PNG заново
             self.assertFalse(np.array_equal(before, read_png(png)))
 
+    def test_unreadable_scene_of_skipped_date_does_not_break_layers(self):
+        """Сцена даты, упавшей в М2 (её слои не рисуются), не читается: остальные даты рисуются, растяжка RGB — без неё."""
+        with tempfile.TemporaryDirectory() as d:
+            data = Path(d)
+            make_dataset(data)
+            (data / "scenes" / f"scene_{DATES[0]}.tif").write_bytes(b"not a tiff")
+            res = ov.build_overlays(data, dates=[DATES[1]])
+            self.assertEqual((res["status"], res["errors"], res["dates"]), ("written", {}, [DATES[1]]))
+            self.assertTrue(any(f"scene_{DATES[0]}.tif: не читается" in w for w in res["warnings"]), res["warnings"])
+            meta = json.loads((data / "overlays" / "meta.json").read_text(encoding="utf-8"))
+            self.assertEqual(meta["rgb"]["season_dates"], [DATES[1]])
+            self.assertEqual(set(meta["layers"][DATES[1]]), {*ov.INDEX_LAYERS, "RGB", "HIDDEN"})
+
     def test_transparent_mode_and_date_subset(self):
         with tempfile.TemporaryDirectory() as d:
             data = Path(d)
@@ -319,6 +365,8 @@ class TestOverlays(unittest.TestCase):
             cr, cc = CLOUD[0].start + 2, CLOUD[1].start + 2
             pr, pc = png_pixel(meta, *self._center(cr, cc), self.grid.crs)
             self.assertEqual(img[pr, pc, 3], 0)
+            self.assertEqual((meta["nodata_color"], meta["nodata_css"]), ([0, 0, 0, 0], "rgba(0, 0, 0, 0)"))
+            self.assertIsNone(meta["hidden"])
             with self.assertRaises(ValueError):
                 ov.build_overlays(data, nodata_mode="hatch")
 

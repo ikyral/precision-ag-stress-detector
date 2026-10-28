@@ -1,5 +1,6 @@
 """Тесты модуля 2. Запуск:  PYTHONPATH=. python -m unittest discover -s tests -v"""
 import json
+import os
 import tempfile
 import unittest
 import warnings
@@ -930,6 +931,136 @@ class NewScenesAndContractTest(unittest.TestCase):
             res = process_new_scenes(self.scenes)
         self.assertEqual(res["processed"], ["2026-06-20"])
         self.assertTrue(any("2026-07-05" in w for w in res["warnings"]))
+
+    def _redownload(self, path, seed=1):
+        """Подменяет сцену другой съёмкой той же даты (как s2fetch --force) и делает её новее stats."""
+        other = write_demo_scenes(self.scenes.parent / f"other_{seed}", seed=seed)
+        src = next(p for p in other if p.name == path.name)
+        src.replace(path)
+        stats = self.data / "stats" / f"index_stats_{parse_date(path.name).replace('-', '_')}.json"
+        t = stats.stat().st_mtime + 10
+        os.utime(path, (t, t))
+
+    def _assert_same_outputs(self, a_dir, b_dir, stamps):
+        for stamp in stamps:
+            for sub, name in (("zones", "zones"), ("hidden_stress", "hidden_stress"), ("indices", "NDRE")):
+                a, _ = read_geotiff(a_dir / sub / f"{name}_{stamp}.tif")
+                b, _ = read_geotiff(b_dir / sub / f"{name}_{stamp}.tif")
+                np.testing.assert_array_equal(a, b, f"{name}_{stamp}")
+            a = json.loads((a_dir / "stats" / f"index_stats_{stamp}.json").read_text(encoding="utf-8"))
+            b = json.loads((b_dir / "stats" / f"index_stats_{stamp}.json").read_text(encoding="utf-8"))
+            for key in ("mean_ndvi", "mean_ndre", "early_stress_alert", "early_stress_area_ha", "early_stress"):
+                self.assertEqual(a[key], b[key], f"{stamp} {key}")
+
+    def test_redownloaded_scene_is_only_warned_about(self):
+        from stress_core import process_new_scenes
+
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore")
+            process_new_scenes(self.scenes)
+            stamp_before = (self.data / "zones" / "zones_2026_06_20.tif").stat().st_mtime_ns
+            self._redownload(self.paths[1])
+            res = process_new_scenes(self.scenes)
+        self.assertEqual(res["processed"], [])
+        self.assertEqual(res["skipped"], ["2026-06-05", "2026-06-20", "2026-07-05"])
+        stale = [w for w in res["warnings"] if "новее результата" in w]
+        self.assertEqual(len(stale), 1)
+        self.assertIn(self.paths[1].name, stale[0])
+        self.assertIn("--reprocess 2026-06-20", stale[0])
+        self.assertNotIn("раньше уже обработанной", stale[0])  # main_pipeline ищет эту фразу
+        self.assertEqual((self.data / "zones" / "zones_2026_06_20.tif").stat().st_mtime_ns, stamp_before)
+
+    def test_reprocess_redownloaded_scene_recomputes_later_dates_like_full_run(self):
+        from stress_core import process_new_scenes
+
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore")
+            process_new_scenes(self.scenes)
+            old_late = json.loads((self.data / "stats" / "index_stats_2026_07_05.json").read_text(encoding="utf-8"))
+            stamp_first = (self.data / "zones" / "zones_2026_06_05.tif").stat().st_mtime_ns
+            self._redownload(self.paths[1])
+            res = process_new_scenes(self.scenes, reprocess=["2026_06_20"])
+            full = self.scenes.parent / "full"
+            run_pipeline(self.paths, full)
+        self.assertEqual(res["processed"], ["2026-06-20", "2026-07-05"])
+        self.assertEqual(res["reprocessed"], ["2026-06-20", "2026-07-05"])
+        self.assertEqual(res["skipped"], ["2026-06-05"])
+        self.assertFalse(res["errors"])
+        self.assertTrue(any("2026-07-05" in w and "decline" in w for w in res["warnings"]))
+        self.assertFalse(any("новее результата" in w for w in res["warnings"]))
+        self.assertEqual((self.data / "zones" / "zones_2026_06_05.tif").stat().st_mtime_ns, stamp_first)
+        self._assert_same_outputs(self.data, full, ("2026_06_05", "2026_06_20", "2026_07_05"))
+        new_late = json.loads((self.data / "stats" / "index_stats_2026_07_05.json").read_text(encoding="utf-8"))
+        self.assertEqual(new_late["early_stress"]["compared_with"], "2026-06-20")
+        self.assertNotEqual(new_late["early_stress"], old_late["early_stress"])  # без каскада 07-05 бы устарела
+        summary = json.loads((self.data / "indices_summary.json").read_text(encoding="utf-8"))
+        self.assertEqual(list(summary["dates"]), ["2026-06-05", "2026-06-20", "2026-07-05"])
+
+    def test_reprocess_with_new_date_and_missing_scene(self):
+        from stress_core import process_new_scenes
+
+        later = self._hide({self.paths[0].name, self.paths[1].name})
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore")
+            process_new_scenes(self.scenes)
+            (later / self.paths[2].name).rename(self.paths[2])
+            res = process_new_scenes(self.scenes, reprocess=["2026-06-05", "2026-08-01"])
+        self.assertEqual(res["processed"], ["2026-06-05", "2026-06-20", "2026-07-05"])
+        self.assertEqual(res["reprocessed"], ["2026-06-05", "2026-06-20"])
+        self.assertTrue(any("2026-08-01" in w and "сцен нет" in w for w in res["warnings"]))
+        self.assertFalse(any("раньше уже обработанной" in w for w in res["warnings"]))
+
+    def test_reprocess_with_later_scene_missing_warns(self):
+        from stress_core import process_new_scenes
+
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore")
+            process_new_scenes(self.scenes)
+            self._hide({self.paths[0].name, self.paths[1].name})
+            res = process_new_scenes(self.scenes, reprocess=["2026-06-05"])
+        self.assertEqual(res["reprocessed"], ["2026-06-05", "2026-06-20"])
+        self.assertTrue(any("2026-07-05" in w and "stress_core run" in w for w in res["warnings"]))
+
+    def test_failed_reprocess_warns_about_dates_built_on_old_result(self):
+        import contextlib
+        import io
+
+        from stress_core import process_new_scenes
+
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore")
+            process_new_scenes(self.scenes)
+            self.paths[1].write_bytes(b"not a tiff")  # перекачка 06-20 оборвалась
+            err = io.StringIO()
+            with contextlib.redirect_stderr(err):
+                res = process_new_scenes(self.scenes, reprocess=["2026-06-20"])
+        self.assertEqual(list(res["errors"]), ["2026-06-20"])
+        self.assertEqual(res["processed"], ["2026-07-05"])
+        self.assertEqual(res["reprocessed"], ["2026-07-05"])
+        late = json.loads((self.data / "stats" / "index_stats_2026_07_05.json").read_text(encoding="utf-8"))
+        self.assertEqual(late["early_stress"]["compared_with"], "2026-06-20")  # прежние индексы 06-20 с диска
+        stale = [w for w in res["warnings"] if "прежнего результата 2026-06-20" in w]
+        self.assertEqual(len(stale), 1)
+        self.assertIn("2026-07-05", stale[0])
+        printed = err.getvalue()
+        self.assertIn("2026-06-20: переобработка не удалась", printed)  # видно и в CLI, а не только в warnings
+        self.assertIn("прежнего результата 2026-06-20", printed)
+        self.assertFalse(any("раньше уже обработанной" in w for w in res["warnings"]))
+
+    def test_cli_update_reprocess(self):
+        from stress_core.__main__ import main
+
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore")
+            self.assertEqual(main(["update", str(self.scenes), "-o", str(self.data)]), 0)
+            stamp_first = (self.data / "zones" / "zones_2026_06_05.tif").stat().st_mtime_ns
+            stamp_late = (self.data / "zones" / "zones_2026_07_05.tif").stat().st_mtime_ns
+            self.assertEqual(main(["update", str(self.scenes), "-o", str(self.data),
+                                   "--reprocess", "2026-06-20"]), 0)
+        self.assertEqual((self.data / "zones" / "zones_2026_06_05.tif").stat().st_mtime_ns, stamp_first)
+        self.assertNotEqual((self.data / "zones" / "zones_2026_07_05.tif").stat().st_mtime_ns, stamp_late)
+        with self.assertRaises(SystemExit):
+            main(["update", str(self.scenes), "--reprocess", "вчера"])
 
     def test_contract_check_passes_and_catches_problems(self):
         from stress_core.contract import check_outputs

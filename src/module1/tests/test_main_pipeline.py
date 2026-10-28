@@ -1,9 +1,12 @@
 """Тесты main_pipeline.py без сети. Запуск из src/module1: python -m unittest discover -s tests -v
 
-Быстрые: свод сезона М3 из metrics_*.json совпадает с vra.batch.run_series, аргументы CLI.
+Быстрые: обёртка свода сезона М3 пишет те же байты, что vra.batch.run_series; аргументы CLI; формулировки
+предупреждений М2, которые main_pipeline разбирает регэкспами (тест падает, если М2 их сменит).
 Медленные (PAS_SLOW_TESTS=1): сцены data/scenes подаются по одной -> итог как у прогона всей серии;
-повторный запуск ничего не меняет; подмена сцены вызывает переобработку; битая сцена не обрывает остальные;
-кабинет М4 через AppTest (все даты × слои, в том числе без indices/*.tif).
+повторный запуск ничего не меняет; подмена сцены -> reprocess даты и более поздних, итог как у полного прогона;
+touch сцен без ложных предупреждений; дата раньше обработанных через reprocess; упавшая переобработка;
+--rebuild; битая сцена не обрывает остальные; кабинет М4 через AppTest (все даты × слои, в том числе без
+indices/*.tif).
 """
 from __future__ import annotations
 
@@ -170,9 +173,57 @@ class TestFetchUnavailable(unittest.TestCase):
                                     f"(см. .env.example). {mp.FETCH_KEYS_HINT}")
 
 
+def _stamp_of(scene: Path) -> str:
+    return scene.stem[len("scene_"):]
+
+
+def _date_of(scene: Path) -> str:
+    return _stamp_of(scene).replace("_", "-")
+
+
+@unittest.skipUnless(_has("stress_core", "rasterio") and len(SCENES) >= 3, "нужны М2 и data/scenes")
+class TestM2WarningFormats(unittest.TestCase):
+    """Настоящие предупреждения process_new_scenes М2 распознаются регэкспами main_pipeline.
+
+    Если М2 сменит формулировку, тест упадёт: ложные предупреждения снова попадут в warnings отчёта.
+    """
+
+    def test_scene_newer_and_earlier_date_are_recognized(self):
+        from stress_core.pipeline import process_new_scenes
+
+        first, mid, last = SCENES[0], SCENES[1], SCENES[2]
+        with tempfile.TemporaryDirectory() as d:
+            d = Path(d)
+            (d / "scenes").mkdir()
+            for s in (first, last):
+                shutil.copy2(s, d / "scenes" / s.name)
+            with contextlib.redirect_stderr(io.StringIO()):
+                process_new_scenes(d / "scenes", d)
+                future = (d / "stats").stat().st_mtime + 3600
+                os.utime(d / "scenes" / first.name, (future, future))     # содержимое то же, mtime новее
+                shutil.copy2(mid, d / "scenes" / mid.name)                   # дата раньше уже обработанной
+                res = process_new_scenes(d / "scenes", d, reprocess=[_date_of(mid)])
+            hashes = {_date_of(s): mp._sha256(d / "scenes" / s.name) for s in (first, mid, last)}
+            saved = {_date_of(first): {"scene_sha256": hashes[_date_of(first)]}}
+            newer = [w for w in res["warnings"] if mp.M2_SCENE_NEWER_RE.match(w)]
+            earlier = [w for w in res["warnings"] if mp.M2_EARLIER_RE.match(w)]
+            self.assertEqual(len(newer), 1, res["warnings"])
+            self.assertTrue(newer[0].startswith(first.name))
+            self.assertEqual(len(earlier), 1, res["warnings"])
+            self.assertEqual(mp.M2_EARLIER_RE.match(earlier[0]).group(1), _date_of(mid))
+            self.assertEqual(res["processed"], [_date_of(mid), _date_of(last)])
+            for w in (*newer, *earlier):
+                self.assertIsNotNone(mp.m2_warning_note(w, hashes, saved, [_date_of(mid)], res["processed"]), w)
+            # подменённая сцена (хэш не совпал) и дата, которую мы в reprocess не передавали, — не информационные
+            self.assertIsNone(mp.m2_warning_note(newer[0], hashes, {_date_of(first): {"scene_sha256": "x"}}, [], []))
+            self.assertIsNone(mp.m2_warning_note(earlier[0], hashes, saved, [], res["processed"]))
+
+
 @unittest.skipUnless(_has("geopandas", "vra"), "нужны зависимости М3 (geopandas)")
 class TestSeasonSummary(unittest.TestCase):
-    def test_matches_run_series(self):
+    def test_wrapper_writes_run_series_bytes(self):
+        """Контракт свода — у М3 (src/module3/tests/test_summary.py); здесь только то, что делает М1:
+        обёртка отдаёт свод М3 и _write_json_exact пишет его теми же байтами, что run_series."""
         from vra import generate_prescription
         from vra.batch import run_series
 
@@ -190,11 +241,124 @@ class TestSeasonSummary(unittest.TestCase):
             self.assertEqual(json.dumps(got), json.dumps(ref))              # и порядок ключей
             mp._write_json_exact(d / "x.json", got)
             self.assertEqual((d / "x.json").read_bytes(), (d / "b" / "season_summary.json").read_bytes())
-            # дата без metrics и дата, упавшая на М2, — в errors в формате run_series
-            part = mp.season_summary(zones, d / "a", {}, {"2026-08-14": "boom"})
-            self.assertEqual([r["date"] for r in part["records"]], ["2026_08_07"])
-            self.assertEqual([set(e) for e in part["errors"]], [{"date", "source_file", "error"}] * 2)
-            self.assertEqual(set(part), set(ref))
+
+
+@unittest.skipUnless(_has("geopandas", "pyogrio", "vra", "rasterio"), "нужны зависимости М3 (geopandas, pyogrio)")
+class TestCrsAudit(unittest.TestCase):
+    """crs_audit: на согласованных выходах ok; испорченный .prj, сдвинутый GeoJSON, неверная площадь,
+    чужой source_grid и неполный ZIP ловятся."""
+    STAMP = "2026_08_07"
+
+    @classmethod
+    def setUpClass(cls):
+        import rasterio
+        from vra import generate_prescription
+
+        from s2fetch.grid import grid_of_file
+
+        cls.tmp = tempfile.TemporaryDirectory(prefix="crs-audit-")
+        cls.base = Path(cls.tmp.name) / "base"
+        (cls.base / "zones").mkdir(parents=True)
+        zones = cls.base / "zones" / f"zones_{cls.STAMP}.tif"
+        shutil.copy(mp.REF_ZONES, zones)
+        generate_prescription(str(zones), str(cls.base / "prescriptions"), cls.STAMP,
+                              reference_mask_path=str(mp.REF_ZONES))
+        with rasterio.open(zones) as z:
+            area = float(((z.read(1) >= 1) & (z.read(1) <= 3)).sum() * 100 / 10_000)
+        (cls.base / "stats").mkdir()
+        (cls.base / "stats" / f"index_stats_{cls.STAMP}.json").write_text(json.dumps(
+            {"field_area_ha": area, "grid": {"width": 104, "height": 104, "pixel_area_m2": 100.0, "crs_epsg": 32637}}),
+            encoding="utf-8")
+        cls.ref = grid_of_file(mp.REF_SCENE)
+        (cls.base / "overlays").mkdir()
+        (cls.base / "overlays" / "meta.json").write_text(json.dumps({"source_grid": {
+            "crs": cls.ref.crs, "transform": list(cls.ref.transform)[:6], "size": [cls.ref.width, cls.ref.height]}}),
+            encoding="utf-8")
+
+    @classmethod
+    def tearDownClass(cls):
+        cls.tmp.cleanup()
+
+    def _copy(self) -> Path:
+        d = Path(tempfile.mkdtemp(dir=self.tmp.name))
+        shutil.copytree(self.base, d / "data")
+        return d / "data"
+
+    def _audit(self, data: Path) -> dict:
+        return mp.crs_audit(data, self.ref)
+
+    def _rezip(self, data: Path, fn) -> None:
+        zpath = data / "prescriptions" / f"shapefile_{self.STAMP}.zip"
+        with zipfile.ZipFile(zpath) as zf:
+            parts = {n: zf.read(n) for n in zf.namelist()}
+        parts = fn(parts)
+        with zipfile.ZipFile(zpath, "w") as zf:
+            for n, b in parts.items():
+                zf.writestr(n, b)
+
+    def test_clean_outputs_ok(self):
+        a = self._audit(self.base)
+        self.assertTrue(a["ok"], a["errors"])
+        rec = a["dates"][self.STAMP]
+        self.assertEqual((rec["shp_epsg"], rec["shp_parts"]), (32637, [".cpg", ".dbf", ".prj", ".shp", ".shx"]))
+        self.assertLessEqual(rec["geojson_max_outside_m"], mp.COVER_TOLERANCE_M)
+        for k in ("area_geojson_ha", "area_shp_ha", "area_zone_breakdown_ha", "area_zones_ha", "area_stats_ha"):
+            self.assertAlmostEqual(rec[k], rec["area_metrics_ha"], delta=mp.AREA_TOLERANCE_HA, msg=k)
+        self.assertEqual(a["meta_source_grid"], "совпадает с сеткой сцен")
+        self.assertIn("crs_audit: ok", mp.crs_audit_line(a))
+
+    def test_bad_prj_detected(self):
+        from pyproj import CRS
+
+        data = self._copy()
+        wgs = CRS.from_epsg(4326).to_wkt("WKT1_ESRI").encode()
+        self._rezip(data, lambda p: {n: (wgs if n.endswith(".prj") else b) for n, b in p.items()})
+        a = self._audit(data)
+        self.assertFalse(a["ok"])
+        self.assertEqual(a["dates"][self.STAMP]["shp_epsg"], 4326)
+        self.assertTrue(any("CRS .prj EPSG:4326" in e for e in a["errors"]), a["errors"])
+
+    def test_incomplete_zip_detected(self):
+        data = self._copy()
+        self._rezip(data, lambda p: {n: b for n, b in p.items() if not n.endswith(".cpg")})
+        a = self._audit(data)
+        self.assertFalse(a["ok"])
+        self.assertTrue(any("состав" in e for e in a["errors"]), a["errors"])
+
+    def test_shifted_geojson_detected(self):
+        data = self._copy()
+        p = data / "prescriptions" / f"prescription_{self.STAMP}.geojson"
+        gj = _json(p)
+
+        def shift(c):
+            return [c[0] + 0.001, c[1]] if isinstance(c[0], (int, float)) else [shift(x) for x in c]
+        for f in gj["features"]:
+            f["geometry"]["coordinates"] = shift(f["geometry"]["coordinates"])
+        p.write_text(json.dumps(gj), encoding="utf-8")
+        a = self._audit(data)
+        self.assertFalse(a["ok"])
+        self.assertGreater(a["dates"][self.STAMP]["geojson_max_outside_m"], 70)      # 0,001° lon ≈ 75 м
+        self.assertTrue(any("за контуром поля" in e for e in a["errors"]), a["errors"])
+
+    def test_wrong_area_detected(self):
+        data = self._copy()
+        p = data / "prescriptions" / f"metrics_{self.STAMP}.json"
+        m = _json(p)
+        m["total_field_area_ha"] += 0.5
+        p.write_text(json.dumps(m), encoding="utf-8")
+        a = self._audit(data)
+        self.assertFalse(a["ok"])
+        self.assertEqual(len([e for e in a["errors"] if "площадь" in e]), 5, a["errors"])   # все 5 сверок
+
+    def test_foreign_source_grid_detected(self):
+        data = self._copy()
+        p = data / "overlays" / "meta.json"
+        m = _json(p)
+        m["source_grid"]["transform"][2] += 10.0
+        p.write_text(json.dumps(m), encoding="utf-8")
+        a = self._audit(data)
+        self.assertFalse(a["ok"])
+        self.assertTrue(any("source_grid" in e for e in a["errors"]), a["errors"])
 
 
 @unittest.skipUnless(SLOW, "медленный тест: PAS_SLOW_TESTS=1")
@@ -228,6 +392,9 @@ class TestPipelineIncremental(unittest.TestCase):
         self.assertEqual(len(list((self.one / "overlays").glob("*_20*.png"))), 6 * len(SCENES))
         summary = _json(self.one / "prescriptions" / "season_summary.json")
         self.assertTrue(summary["area_stable"])
+        audit = self.all_report["checks"]["crs_audit"]
+        self.assertTrue(audit["ok"], audit["errors"])
+        self.assertEqual(audit["summary"]["dates"], len(SCENES))
         self.assertEqual(summary["dates_processed"], len(SCENES))
 
     def test_2_rerun_changes_nothing(self):
@@ -237,7 +404,20 @@ class TestPipelineIncremental(unittest.TestCase):
         self.assertEqual(snapshot(self.one), before)
         self.assertEqual([s["status"] for s in rep["stages"]], ["skipped", "unchanged", "unchanged", "unchanged", "ok"])
 
+    def _m2(self, rep: dict) -> dict:
+        return next(s for s in rep["stages"] if s["name"] == "M2")
+
+    def _fresh_full_run(self, name: str, scenes_from: Path) -> Path:
+        """Полный прогон с нуля по сценам папки scenes_from — эталон для сравнения."""
+        ref = Path(self.tmp.name) / name
+        (ref / "scenes").mkdir(parents=True)
+        for s in sorted((scenes_from / "scenes").glob("scene_*.tif")):
+            shutil.copy2(s, ref / "scenes" / s.name)
+        self.assertEqual(run_pipeline(ref)[0], 0)
+        return ref
+
     def test_3_replaced_scene_reprocessed(self):
+        """Подмена сцены: reprocess этой даты и всех более поздних, ранние не тронуты, итог как у полного прогона."""
         import rasterio
 
         from s2fetch.grid import grid_of_file
@@ -246,28 +426,127 @@ class TestPipelineIncremental(unittest.TestCase):
         work = Path(self.tmp.name) / "replaced"
         shutil.copytree(self.one, work)
         target = SCENES[len(SCENES) // 2]
-        date = target.stem[len("scene_"):].replace("_", "-")
+        date, stamp = _date_of(target), _stamp_of(target)
         with rasterio.open(target) as src:
             data, tags = src.read(), src.tags()
         data[6] = np.where(np.isfinite(data[6]) & (data[6] > 0), data[6] * np.float32(0.8), data[6])  # B08 −20 %
         write_scene(work / "scenes" / target.name, data, grid_of_file(target), tags)
+        before = snapshot(work)
         code, rep = run_pipeline(work)
         self.assertEqual(code, 0)
-        m2 = next(s for s in rep["stages"] if s["name"] == "M2")
-        self.assertIn(date, m2["full_rerun_reason"])
-        later = [s.stem[len("scene_"):].replace("_", "-") for s in SCENES if s.name >= target.name]
-        self.assertTrue(set(later) <= set(rep["dates"]["m2_processed"]))
-        self.assertTrue(set(later) <= set(rep["dates"]["m3_processed"]))
-        stamp = target.stem[len("scene_"):]
+        m2 = self._m2(rep)
+        later = [_date_of(s) for s in SCENES if s.name >= target.name]
+        self.assertEqual((m2["mode"], m2["full_rerun_reason"]), ("process_new_scenes", None))
+        self.assertEqual(m2["reprocess_asked"], [date])
+        self.assertEqual(m2["changed_scenes"], [date])
+        self.assertEqual(m2["reprocessed"], later)
+        self.assertEqual(m2["cascade"], later[1:])
+        self.assertEqual(rep["dates"]["m2_processed"], later)
+        self.assertEqual(rep["dates"]["m3_processed"], later)
+        self.assertFalse([w for w in rep["warnings"] if "сцена новее" in w or "всю серию" in w], rep["warnings"])
+        # файлы М2 и М3 более ранних дат не тронуты (размер, mtime, sha256)
+        after = snapshot(work)
+        earlier = [_stamp_of(s) for s in SCENES if s.name < target.name]
+        dirs = ("zones/", "stats/", "indices/", "hidden_stress/", "prescriptions/")
+        early_files = [f for f in before if f.startswith(dirs) and any(e in f for e in earlier)]
+        self.assertTrue(early_files)
+        self.assertEqual({f: after[f] for f in early_files}, {f: before[f] for f in early_files})
         changed = content_diff(work, self.all)
         self.assertIn(f"zones/zones_{stamp}.tif", changed)
         self.assertIn(f"prescriptions/metrics_{stamp}.json", changed)
         self.assertIn(f"overlays/NDVI_{stamp}.png", changed)
-        earlier = [s.stem[len("scene_"):] for s in SCENES if s.name < target.name]
-        self.assertFalse([c for c in changed if any(e in c for e in earlier) and "overlays" not in c])
+        # итог совпадает с полным прогоном по той же подменённой серии
+        self.assertEqual(content_diff(work, self._fresh_full_run("replaced_ref", work)), [])
         # вернули исходную сцену — результат снова как у исходной серии
         shutil.copy2(target, work / "scenes" / target.name)
         self.assertEqual(run_pipeline(work)[0], 0)
+        self.assertEqual(content_diff(work, self.all), [])
+
+    def test_6_touch_scenes_no_false_warnings(self):
+        """mtime сцен новее результатов, содержимое то же: ничего не пересчитано, в warnings пусто."""
+        work = Path(self.tmp.name) / "touched"
+        shutil.copytree(self.one, work)
+        future = max(p.stat().st_mtime for p in (work / "stats").iterdir()) + 3600
+        for s in (work / "scenes").glob("scene_*.tif"):
+            os.utime(s, (future, future))
+        before = snapshot(work)
+        code, rep = run_pipeline(work)
+        self.assertEqual(code, 0)
+        self.assertEqual(snapshot(work), before)
+        self.assertEqual((rep["warnings"], rep["info"]), ([], []))
+        self.assertEqual([s["status"] for s in rep["stages"]], ["skipped", "unchanged", "unchanged", "unchanged", "ok"])
+        # новая дата при «тронутых» старых: М2 вызывается и шлёт mtime-предупреждения — они уходят в info
+        last = _stamp_of(SCENES[-1])
+        for p in (work / "zones" / f"zones_{last}.tif", work / "stats" / f"index_stats_{last}.json"):
+            p.unlink()
+        code, rep = run_pipeline(work)
+        self.assertEqual(code, 0)
+        self.assertEqual(rep["dates"]["m2_processed"], [_date_of(SCENES[-1])])
+        self.assertEqual(rep["warnings"], [])
+        self.assertEqual(len(rep["info"]), len(SCENES) - 1, rep["info"])
+        self.assertTrue(all("сцена новее результата" in i and "sha256 сцены совпал" in i for i in rep["info"]))
+        self.assertEqual(content_diff(work, self.all), [])
+
+    def test_7_earlier_date_via_reprocess(self):
+        """Дата раньше уже обработанных идёт через reprocess; ложное «перезапустите всю серию» — в info."""
+        work = Path(self.tmp.name) / "earlier"
+        (work / "scenes").mkdir(parents=True)
+        mid = SCENES[1]
+        for s in SCENES:
+            if s != mid:
+                shutil.copy2(s, work / "scenes" / s.name)
+        self.assertEqual(run_pipeline(work)[0], 0)
+        shutil.copy2(mid, work / "scenes" / mid.name)
+        code, rep = run_pipeline(work)
+        self.assertEqual(code, 0)
+        m2 = self._m2(rep)
+        later = [_date_of(s) for s in SCENES if s.name > mid.name]
+        self.assertEqual((m2["mode"], m2["reprocess_asked"], m2["earlier_new_dates"]),
+                         ("process_new_scenes", [_date_of(mid)], [_date_of(mid)]))
+        self.assertEqual(m2["reprocessed"], later)
+        # в warnings — только честное сообщение М2 о каскаде; ложное «перезапустите всю серию» — в info
+        self.assertEqual(len(rep["warnings"]), 1, rep["warnings"])
+        self.assertIn("пересчитаны и обработанные даты позже", rep["warnings"][0])
+        self.assertFalse([w for w in rep["warnings"] if "всю серию" in w])
+        self.assertEqual(len([i for i in rep["info"] if "раньше уже обработанной" in i]), 1, rep["info"])
+        self.assertEqual(content_diff(work, self.all), [])
+
+    def test_8_failed_reprocess(self):
+        """Переобработка упала: дата — ошибка (код 1), М3 и слои для неё не запускаются, прежние zones/stats на месте,
+        более поздние даты, посчитанные от прежнего результата, — в warnings."""
+        work = Path(self.tmp.name) / "failed_reprocess"
+        shutil.copytree(self.all, work)
+        target = SCENES[len(SCENES) // 2]
+        date, stamp = _date_of(target), _stamp_of(target)
+        keep = [f"zones/zones_{stamp}.tif", f"stats/index_stats_{stamp}.json", f"prescriptions/metrics_{stamp}.json"]
+        before = snapshot(work)
+        (work / "scenes" / target.name).write_bytes(b"not a tiff")
+        code, rep = run_pipeline(work)
+        self.assertEqual(code, 1)
+        self.assertEqual(rep["errors"][date]["stage"], "M2")
+        self.assertEqual(self._m2(rep)["reprocess_asked"], [date])
+        self.assertNotIn(date, rep["dates"]["m3_processed"])
+        self.assertNotIn(stamp, rep["dates"]["layers"])
+        after = snapshot(work)
+        self.assertEqual({f: after[f] for f in keep}, {f: before[f] for f in keep})
+        self.assertFalse(list((work / "overlays").glob(f"*_{stamp}.png")))
+        self.assertTrue([w for w in rep["warnings"] if f"от прежнего результата {date}" in w], rep["warnings"])
+        self.assertIsNone(_json(work / mp.STATE_NAME)["dates"][date]["scene_sha256"])
+        self.assertTrue(rep["checks"]["m2_contract"]["ok"])                    # check_outputs — после М2
+        # сцену вернули: следующий запуск снова переобрабатывает дату, итог как у исходной серии
+        shutil.copy2(target, work / "scenes" / target.name)
+        code, rep = run_pipeline(work)
+        self.assertEqual((code, self._m2(rep)["reprocess_asked"]), (0, [date]))
+        self.assertEqual(content_diff(work, self.all), [])
+
+    def test_9_rebuild_on_existing_results(self):
+        """--rebuild поверх готовых результатов (в КТ3 падал KeyError): вся серия, итог тот же."""
+        work = Path(self.tmp.name) / "rebuild"
+        shutil.copytree(self.all, work)
+        code, rep = run_pipeline(work, "--rebuild")
+        self.assertEqual(code, 0)
+        self.assertEqual(self._m2(rep)["full_rerun_reason"], "--rebuild")
+        self.assertEqual(rep["dates"]["m2_processed"], [_date_of(s) for s in SCENES])
         self.assertEqual(content_diff(work, self.all), [])
 
     def test_4_broken_scene_does_not_stop_others(self):
@@ -290,8 +569,9 @@ class TestPipelineIncremental(unittest.TestCase):
         with contextlib.redirect_stderr(io.StringIO()):
             res = check_m4.check(self.one, expect_dates=len(SCENES))
         self.assertEqual(res["problems"], [])
-        self.assertEqual(res["full"]["renders"], 5 * len(SCENES))
-        self.assertEqual(res["png_only"]["renders"], 5 * len(SCENES))
+        n_layers = len(check_m4.app_layers())             # слои — из LAYERS app.py, а не константой
+        self.assertEqual(res["full"]["renders"], n_layers * len(SCENES))
+        self.assertEqual(res["png_only"]["renders"], n_layers * len(SCENES))
         self.assertEqual(res["png_only"]["indices_tif_left"], 0)
 
 

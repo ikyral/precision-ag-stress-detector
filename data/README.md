@@ -30,7 +30,7 @@ python main_pipeline.py --start 2026-06-29 --end 2026-08-30   # сначала �
 | `overlays/overlay_check.html` | М1 `tools/overlay_map.py` | нет | карта для проверки совмещения в браузере |
 | `field_boundary.geojson` | `main_pipeline` | нет | копия контура для М4, только если `--data-dir` не `data/` |
 | `pipeline_state.json` | `main_pipeline` | нет | sha256 сцен и масок зон, по которым считали М2 и М3 |
-| `pipeline_report.json` | `main_pipeline` | нет | отчёт последнего запуска: этапы, даты, ошибки, проверки, время |
+| `pipeline_report.json` | `main_pipeline` | нет | отчёт последнего запуска (схема 1.1): этапы, даты, `errors`, `warnings`, `info` (предупреждения М2, ложные по sha256, с пояснением), проверки (в т. ч. `crs_audit`: CRS и площади выходов М3 против сетки сцен), время |
 
 В git лежат только `samples/`, `scenes/*.tif`, `scenes/scenes_manifest.json` и этот файл (см. `.gitignore`).
 Всё остальное воспроизводится командой `python main_pipeline.py --skip-fetch` примерно за 4 с.
@@ -56,10 +56,13 @@ PNG строятся на сетке **EPSG:3857** (Leaflet растягивае
 | `field_name` | да | **не пишется**: имя поля берётся из `field_boundary.geojson` |
 | `colormaps` | нет | палитры `CMAP_VEG` (NDVI, NDRE, MSAVI) и `CMAP_WATER` (NDMI) из `app.py`: `[[доля, [r, g, b]], ...]` |
 | `alpha` | нет | 235 — альфа индексов и HIDDEN внутри поля (как `colorize` в М4); М4 добавляет `opacity=0.85` слоя |
-| `nodata_mode`, `nodata_color`, `nodata_meaning` | нет | облако/тень внутри поля: `gray` → `[128,128,128,150]` (по умолчанию) или `transparent`; вне поля всегда alpha 0 |
+| `nodata_mode`, `nodata_color`, `nodata_meaning` | нет | облако/тень внутри поля: `gray` → `[128,128,128,150]` (по умолчанию) или `transparent`; вне поля всегда alpha 0. `nodata_meaning` — длинное пояснение, не для легенды |
+| `nodata_label`, `nodata_css` | легенда (1.1) | короткая подпись «Нет данных (облако/тень)» и CSS того же цвета: `rgba(128, 128, 128, 0.588)` (`transparent` → `rgba(0, 0, 0, 0)`) |
 | `rgb` | нет | true color B04, B03, B02, alpha 255. Растяжка одна на три канала и на сезон: `min_reflectance`/`max_reflectance` — перцентили `percentiles` (2, 98) отражения всех трёх каналов по пикселям поля всех дат (`season_dates`); `gamma` 1.3; `formula` — как считается пиксель. Превью М1 (`scenes/preview`) растягивается по-старому (0…0.18, гамма 1.6) |
+| `rgb.label`, `rgb.legend_text` | легенда (1.1) | «Снимок Sentinel-2 (RGB)» и «Sentinel-2 L2A, true color (B04, B03, B02)» |
 | `hidden` | нет | слой HIDDEN: 1 — цвет `[231,76,60,235]`, 0 — прозрачно, 255 в поле — `nodata_color` |
-| `schema_version`, `generated_at`, `generator` | нет | версия схемы (`1.0`), время, кто записал |
+| `hidden.label`, `hidden.css` | легенда (1.1) | «Скрытый стресс (М2)» и `rgba(231, 76, 60, 0.922)` |
+| `schema_version`, `generated_at`, `generator` | нет | версия схемы (`1.1`), время, кто записал |
 | `render_crs`, `render_grid` | нет | `EPSG:3857`; размер PNG, шаг (м), `bounds_3857`, `oversample`, метод |
 | `source_grid` | нет | CRS, transform и размер сетки сцен |
 | `dates` | нет | даты со слоями, `YYYY_MM_DD` |
@@ -69,7 +72,11 @@ PNG строятся на сетке **EPSG:3857** (Leaflet растягивае
 
 Шкала зависит от всех дат, поэтому при новой дате перерисовываются все PNG. М4 берёт PNG вместо
 `indices/*.tif`, если есть `overlays/{INDEX}_{YYYY_MM_DD}.png` и `meta.bounds`. Слои RGB и HIDDEN М4 пока
-не показывает.
+не показывает (готовит в PR `module4-data-checks`).
+
+Легенда (схема 1.1, только добавления к 1.0): `*_css` — тот же цвет, которым закрашены пиксели PNG
+(`rgba(r, g, b, alpha/255)`, альфа с 3 знаками), без `opacity` слоя: для PNG М4 ставит `opacity=1`. Цвета и
+CSS берутся из одних констант `s2fetch.overlays` (`HIDDEN_COLOR`, `NODATA_GRAY`), тест сверяет их с пикселями PNG.
 
 ## Эталоны `samples/`
 
