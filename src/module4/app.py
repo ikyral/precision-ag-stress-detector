@@ -95,7 +95,11 @@ INDEX_SERIES = [("mean_ndvi", "NDVI", "#27ae60"), ("mean_ndre", "NDRE", "#c0392b
                 ("mean_msavi", "MSAVI", "#8d6e3f"), ("mean_ndmi", "NDMI", "#2980b9")]
 
 ESRI_TILES = "https://server.arcgisonline.com/ArcGIS/rest/services/World_Imagery/MapServer/tile/{z}/{y}/{x}"
-ESRI_ATTR = "Tiles &copy; Esri — Source: Esri, Maxar, Earthstar Geographics, and the GIS User Community"
+ESRI_ATTR = "&copy; Esri, Maxar, Earthstar Geographics"
+# подпись источника справа внизу не должна наезжать на шкалу масштаба слева внизу
+MAP_CSS = ("<style>.leaflet-control-attribution{font-size:10px;max-width:55%;white-space:normal;"
+           "line-height:1.25}.leaflet-control-scale{margin-bottom:6px!important}"
+           ".leaflet-control-scale-line:nth-child(2){display:none}</style>")  # только метры, без футов
 
 st.set_page_config(page_title="Precision Ag Stress Detector", page_icon="🛰️", layout="wide")
 st.markdown(
@@ -109,6 +113,13 @@ st.markdown(
       div[data-testid="stMetricLabel"] p {font-size: 0.86rem; opacity: 0.8;}
       div[data-testid="stMetricValue"] {font-size: 1.3rem;}
       div[data-testid="stMetricValue"] > div {white-space: normal; overflow-wrap: anywhere;}
+      /* подписи и дельты KPI переносятся, а не обрезаются многоточием; карточки одной высоты */
+      div[data-testid="stMetric"] .stMarkdownEllipsis,
+      div[data-testid="stMetric"] .stMarkdownEllipsis p {white-space: normal !important; text-overflow: clip;
+                                                        overflow: visible;}
+      div[data-testid="stElementContainer"]:has(> div[data-testid="stMetric"]) {flex: 1 1 auto;}
+      div[data-testid="stMetric"] {height: 100%; box-sizing: border-box;}
+      .pas-chart-title {font-weight: 600; font-size: 0.98rem; margin: 2px 0 0 0;}
       .pas-alert {background: rgba(231, 76, 60, 0.12); border-left: 6px solid #e74c3c;
                   border-radius: 8px; padding: 12px 16px; margin: 4px 0 14px 0; font-size: 0.98rem;}
       .pas-alert ul {margin: 6px 0 0 0;}
@@ -618,6 +629,7 @@ def normalize_prescription(gj, rates: dict | None, name: str):
 
 def build_map(field_gj, presc_gj, raster_rgba, raster_bounds, outline_only, raster_opacity=0.85):
     m = folium.Map(tiles=None, control_scale=True)
+    m.get_root().header.add_child(folium.Element(MAP_CSS))
     folium.TileLayer(tiles=ESRI_TILES, attr=ESRI_ATTR, name="Спутник Esri", max_zoom=19).add_to(m)
 
     if raster_rgba is not None:
@@ -758,11 +770,14 @@ def index_history_chart(hist: pd.DataFrame, selected: datetime):
                                              line=dict(color="#e74c3c", width=2.5)),
                                  hovertemplate="Ранний сигнал стресса<extra></extra>"))
     fig.add_vline(x=selected, line_dash="dash", line_color="#7f8c8d", line_width=1.5)
+    # метки оси — ровно даты снимков (plotly сам ставит редкие «круглые» даты, и снимки между ними не подписаны)
+    dts = list(hist["dt"])
     fig.update_layout(
-        height=310, margin=dict(l=10, r=10, t=36, b=10), hovermode="x unified",
-        title=dict(text="Динамика вегетационных индексов (среднее по полю)", font=dict(size=14)),
-        legend=dict(orientation="h", yanchor="bottom", y=-0.32, x=0),
-        xaxis=dict(title="Дата снимка", tickformat="%d.%m"), yaxis=dict(title="Значение индекса"),
+        height=330, margin=dict(l=10, r=10, t=10, b=10), hovermode="x unified",
+        legend=dict(orientation="h", yanchor="bottom", y=1.02, x=0, title=None, font=dict(size=11)),
+        xaxis=dict(title="Дата снимка", tickmode="array", tickvals=dts, ticktext=[d.strftime("%d.%m") for d in dts],
+                   tickangle=-60 if len(dts) > 6 else 0, tickfont=dict(size=10), hoverformat="%d.%m.%Y"),
+        yaxis=dict(title="Среднее значение индекса"),
     )
     return fig
 
@@ -777,13 +792,19 @@ def zones_donut(econ):
         hovertemplate="%{label}<br>%{value:.2f} га (%{percent})<extra></extra>",
     ))
     fig.update_layout(
-        height=290, margin=dict(l=10, r=10, t=36, b=10),
-        title=dict(text="Распределение площади по зонам", font=dict(size=14)),
+        height=270, margin=dict(l=10, r=10, t=20, b=10),
         legend=dict(orientation="h", yanchor="bottom", y=-0.2, x=0),
         annotations=[dict(text=f"<b>{fmt_num(econ['total_ha'], 1)}</b><br>га", x=0.5, y=0.5,
                           showarrow=False, font=dict(size=16))],
     )
     return fig
+
+
+def chart_title(title: str, note: str = "") -> None:
+    """Заголовок графика над ним: заголовок внутри plotly обрезается в узкой колонке."""
+    st.markdown(f'<div class="pas-chart-title">{html.escape(title)}</div>', unsafe_allow_html=True)
+    if note:
+        st.caption(note)
 
 
 def show_plotly(fig):
@@ -1016,12 +1037,14 @@ with right:
         if missing:
             report(f"В index_stats нет средних значений для {', '.join(missing)} "
                    f"(ожидаются поля {', '.join('mean_' + i.lower() for i in missing)}) — линии не показаны.")
+        chart_title("Динамика вегетационных индексов", "Среднее по полю; пунктир — выбранная дата.")
         show_plotly(index_history_chart(hist, parse_date(sel_date)))
         if len(hist) == 1:
             st.caption("Пока доступна одна дата — динамика появится, когда Модуль 1 выгрузит серию снимков.")
     else:
         st.info("Нет файлов stats/index_stats_*.json для графика динамики.")
     if econ and econ["zones"]:
+        chart_title("Распределение площади по зонам")
         show_plotly(zones_donut(econ))
 
 if econ:
