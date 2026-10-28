@@ -10,8 +10,10 @@
 даты обрабатываются. Код выхода: 0 — ок, 1 — ошибки обработки, 2 — данные есть, но проверки не прошли.
 
 Состояние <data>/pipeline_state.json: sha256 сцены, по которой М2 считал дату, и маски зон, по которой М3
-строил предписание. Если сцену подменили (например, s2fetch --force), М2 пересчитывает всю серию, а М3 —
-изменившиеся даты: process_new_scenes М2 сам такие даты не видит (zones и stats уже есть).
+строил предписание. Если сцену подменили (например, s2fetch --force) или пришла дата раньше уже обработанных,
+М2 переобрабатывает её через process_new_scenes(reprocess=[...]) — вместе с ней М2 сам пересчитывает все более
+поздние даты; М3 — изменившиеся даты. Вся серия заново — только --rebuild. Источник истины — sha256, а не mtime:
+предупреждение М2 «сцена новее результата» при совпавшем хэше уходит в info отчёта, а не в warnings.
 """
 from __future__ import annotations
 
@@ -20,6 +22,7 @@ import datetime as dt
 import hashlib
 import json
 import math
+import re
 import shutil
 import sys
 import time
@@ -37,11 +40,15 @@ for _p in ("src/module1", "src/module2", "src/module3"):
 
 STATE_NAME = "pipeline_state.json"
 REPORT_NAME = "pipeline_report.json"
-SCHEMA_VERSION = "1.0"
+SCHEMA_VERSION = "1.1"  # 1.1: info в отчёте; М2 через reprocess
 COVER_TOLERANCE_M = 10.0  # рамка предписаний строится по пикселям 10 м, контур может выступать до пикселя
 FETCH_KEYS_HINT = "Без ключей CDSE используйте --skip-fetch."
 FETCH_DEPS_HINT = ("Для скачивания нужны зависимости М1: pip install -r src/module1/requirements.txt. "
                    + FETCH_KEYS_HINT)
+# формулировки предупреждений process_new_scenes М2 (машинного кода у них нет; тест упадёт, если М2 их сменит)
+M2_SCENE_NEWER_RE = re.compile(r"^scene_(\d{4})_(\d{2})_(\d{2})\.tif: сцена новее результата ")
+M2_EARLIER_RE = re.compile(r"^даты (\d{4}-\d{2}-\d{2}(?:, \d{4}-\d{2}-\d{2})*) раньше уже обработанной "
+                           r"\d{4}-\d{2}-\d{2}: динамика более поздних дат посчитана без них")
 
 
 # ----------------------------------------------------------------------------
@@ -106,6 +113,7 @@ class Report:
             "dates": {},
             "errors": {},
             "warnings": [],
+            "info": [],
             "checks": {},
         }
 
@@ -120,6 +128,10 @@ class Report:
 
     def warn(self, message: str) -> None:
         self.doc["warnings"].append(message)
+
+    def info(self, message: str) -> None:
+        """Не проблема: пояснение к предупреждению, которое по sha256 оказалось ложным."""
+        self.doc["info"].append(message)
 
 
 # ----------------------------------------------------------------------------
@@ -169,8 +181,33 @@ def stage_fetch(args, data: Path, rep: Report) -> list[str]:
     return written
 
 
+def m2_warning_note(w: str, hashes: dict, saved: dict, asked: list[str], processed: list[str]) -> str | None:
+    """Пояснение, если предупреждение М2 ложное (тогда оно идёт в info), иначе None.
+
+    - «сцена новее результата» — по mtime; если sha256 сцены совпал с pipeline_state.json, сцена не менялась
+      (git pull/checkout, копирование);
+    - «даты … раньше уже обработанной … перезапустите всю серию» — для дат, которые мы сами передали в reprocess:
+      М2 вместе с ними пересчитал все более поздние даты, ряд точный.
+    """
+    m = M2_SCENE_NEWER_RE.match(w)
+    if m:
+        d = "-".join(m.groups())
+        if d in hashes and saved.get(d, {}).get("scene_sha256") == hashes[d]:
+            return "sha256 сцены совпал с pipeline_state.json: содержимое не менялось, новее только mtime"
+        return None
+    m = M2_EARLIER_RE.match(w)
+    if m:
+        dates = m.group(1).split(", ")
+        later = [d for d in hashes if d > min(dates)]
+        if set(dates) <= set(asked) and set(later) <= set(processed):
+            return (f"даты переданы в reprocess, М2 пересчитал и все более поздние ({len(later)}): "
+                    "ряд совпадает с полным прогоном")
+    return None
+
+
 def stage_m2(args, data: Path, state: dict, fetched: list[str], rep: Report) -> tuple[list[str], set[str]]:
-    """М2: новые даты через process_new_scenes, при подмене сцены или дате в прошлом — вся серия.
+    """М2: process_new_scenes — новые даты и reprocess (подменённые сцены и даты раньше обработанных);
+    --rebuild — вся серия через run_pipeline.
 
     Возвращает (даты, обработанные в этом запуске, даты с ошибкой М2).
     """
@@ -194,37 +231,43 @@ def stage_m2(args, data: Path, state: dict, fetched: list[str], rep: Report) -> 
                  "как есть, хэши сцен сохранены")
         for d in trusted:
             sd.setdefault(d, {})["scene_sha256"] = hashes[d]
-    changed = sorted(d for d in done if d in hashes and sd[d]["scene_sha256"] != hashes[d])
+    changed = [] if args.rebuild else sorted(d for d in done if d in hashes and sd[d]["scene_sha256"] != hashes[d])
     new = sorted(d for d in hashes if d not in done)
     late = sorted(d for d in new if done and d < max(done))
-    reason = ("--rebuild" if args.rebuild else
-              f"сцены изменились после обработки: {', '.join(changed)}" if changed else
-              f"новые даты раньше уже обработанных: {', '.join(late)}" if late else None)
-    if reason is None and new:
-        res = process_new_scenes(scenes_dir, data)
-        processed, errors = res["processed"], res["errors"]
-        if any("раньше уже обработанной" in w for w in res["warnings"]):  # страховка: М2 сам заметил
-            reason = "предупреждение М2 о дате раньше обработанной"
-        else:
-            for w in res["warnings"]:
-                rep.warn(f"M2: {w}")
-    elif reason is None:
-        processed, errors = [], {}
-    if reason is not None:
+    asked = sorted(set(changed) | set(late))
+    reprocessed: list[str] = []
+    if args.rebuild:
         summary = run_pipeline([scenes_dir], data)
         processed = sorted(d for d, r in summary["dates"].items() if d in hashes and "error" not in r)
         errors = {d: r["error"] for d, r in summary["dates"].items() if d in hashes and "error" in r}
+    elif new or asked:
+        res = process_new_scenes(scenes_dir, data, reprocess=asked or None)
+        processed, errors, reprocessed = sorted(res["processed"]), dict(res["errors"]), sorted(res["reprocessed"])
+        for w in res["warnings"]:
+            note = m2_warning_note(w, hashes, sd, asked, processed)
+            if note:
+                rep.info(f"M2: {w} [информационно: {note}]")
+            else:
+                rep.warn(f"M2: {w}")
+        lost = [d for d in asked if d not in processed and d not in errors]
+        if lost or not set(reprocessed) <= set(processed):
+            rep.error("*", "M2", f"М2 не вернул даты, переданные на переобработку: {', '.join(lost)}"
+                      if lost else f"reprocessed {reprocessed} не входят в processed {processed}")
+    else:
+        processed, errors = [], {}
     for d in processed:
         sd.setdefault(d, {})["scene_sha256"] = hashes[d]
     for d, e in errors.items():
-        sd.setdefault(d, {})["scene_sha256"] = None  # следующий запуск попробует снова
+        sd.setdefault(d, {})["scene_sha256"] = None  # следующий запуск попробует снова (через reprocess)
         rep.error(d, "M2", e)
     skipped = sorted(d for d in hashes if d not in processed and d not in errors)
     rep.stage("M2", "error" if errors else ("ok" if processed else "unchanged"), t,
-              mode="run_pipeline (вся серия)" if reason else "process_new_scenes",
-              full_rerun_reason=reason, processed=sorted(processed), skipped=skipped, errors=sorted(errors),
-              changed_scenes=changed, fetched_this_run=fetched)
-    return sorted(processed), set(errors)
+              mode="run_pipeline (вся серия, --rebuild)" if args.rebuild else "process_new_scenes",
+              full_rerun_reason="--rebuild" if args.rebuild else None, processed=processed,
+              reprocess_asked=asked, reprocessed=reprocessed, cascade=sorted(set(reprocessed) - set(asked)),
+              skipped=skipped, errors=sorted(errors), changed_scenes=changed, earlier_new_dates=late,
+              fetched_this_run=fetched)
+    return processed, set(errors)
 
 
 def stage_m3(args, data: Path, state: dict, m2_processed: list[str], m2_failed: set[str],
@@ -483,11 +526,13 @@ def main(argv=None) -> int:
 
     print(f"\nmain_pipeline: {data}")
     for st in d["stages"]:  # текст ошибки этапа — ниже, в строке ОШИБКА
-        extra = {k: st[k] for k in ("processed", "written", "errors", "full_rerun_reason", "png_count", "failed")
-                 if st.get(k)}
+        extra = {k: st[k] for k in ("processed", "reprocessed", "written", "errors", "full_rerun_reason", "png_count",
+                                    "failed") if st.get(k)}
         print(f"  {st['name']:9} {st['status']:9} {st['seconds']:7.2f} c  {extra if extra else ''}")
     for w in d["warnings"]:
         print("  предупреждение:", w)
+    if d["info"]:
+        print(f"  инфо: {len(d['info'])} (ложные предупреждения М2, пояснения в {REPORT_NAME} -> info)")
     for k, e in d["errors"].items():
         print(f"  ОШИБКА {k} [{e['stage']}]: {e['error']}")
     print(f"  проверки: {'ok' if checks_ok else 'НЕ ПРОЙДЕНЫ'}; отчёт {data / REPORT_NAME}; "
