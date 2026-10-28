@@ -280,53 +280,10 @@ def stage_m3(args, data: Path, state: dict, m2_processed: list[str], m2_failed: 
 
 def season_summary(zones_dir: Path, out: Path, failed: dict[str, str], upstream: dict[str, str],
                    area_tolerance_ha: float = 0.01) -> dict:
-    """season_summary.json из готовых metrics_*.json, без повторной векторизации.
-
-    Схема и порядок полей — как у vra.batch.run_series (сверяется тестом). failed — ошибки М3 этого запуска,
-    upstream — даты, упавшие раньше (М2): они не попадают в records, а идут в errors.
-    """
-    from vra.batch import date_from_path
-
-    files = sorted(p for p in zones_dir.rglob("*") if p.is_file() and p.suffix.lower() in {".tif", ".tiff"}
-                   and p.stem.startswith("zones_"))
-    rows, errors = [], []
-    for date_str, path in sorted((date_from_path(p), p) for p in files):
-        iso = _iso(date_str)
-        err = failed.get(iso) or (f"M2: {upstream[iso]}" if iso in upstream else None)
-        metrics_path = out / f"metrics_{date_str}.json"
-        if err is None and not metrics_path.exists():
-            err = f"FileNotFoundError: нет {metrics_path.name}"
-        if err is not None:
-            errors.append({"date": date_str, "source_file": path.name, "error": err})
-            continue
-        metrics = json.loads(metrics_path.read_text(encoding="utf-8"))
-        rows.append({
-            "date": date_str,
-            "source_file": path.name,
-            "total_field_area_ha": metrics["total_field_area_ha"],
-            "stressed_area_ha": metrics["stressed_area_ha"],
-            "saved_percent": metrics["saved_percent"],
-            "saved_money_rub": metrics["saved_money_rub"],
-            "coverage": metrics.get("coverage"),
-            "files": {"geojson": metrics["files"]["geojson"],
-                      "shapefile_zip": metrics["files"]["shapefile_zip"],
-                      "metrics": metrics["files"]["metrics"]},
-        })
-    areas = [r["total_field_area_ha"] for r in rows]
-    spread = max(areas) - min(areas) if areas else None
-    stable = spread <= area_tolerance_ha + 1e-10 if len(areas) > 1 else None
-    return {
-        "schema_version": "1.0",
-        "dates_found": len(files), "dates_processed": len(rows),
-        "area_tolerance_ha": area_tolerance_ha,
-        "area_range_ha": [min(areas), max(areas)] if areas else None,
-        "area_spread_ha": spread, "area_stable": stable,
-        "coverage_note": "Area includes classified pixels, including upstream-filled classes. Remaining input nodata is excluded. See M2 stats for observed/filled area. One input directory must contain one field.",
-        "warnings": (["Classified field area changes between dates; inspect no-data masks and alignment."]
-                     if stable is False else []),
-        "records": rows, "errors": errors,
-        "incomplete_dates": [r["date"] for r in rows if r["coverage"] and not r["coverage"]["is_complete"]],
-    }
+    """Compatibility wrapper: the summary contract is owned by Module 3."""
+    from vra.batch import build_season_summary
+    return build_season_summary(out, zones_dir=zones_dir, failed=failed,
+                                upstream=upstream, area_tolerance_ha=area_tolerance_ha)
 
 
 def _write_json_exact(path: Path, doc: dict) -> None:
