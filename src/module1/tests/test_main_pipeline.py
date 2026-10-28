@@ -290,8 +290,9 @@ class TestPipelineIncremental(unittest.TestCase):
         with contextlib.redirect_stderr(io.StringIO()):
             res = check_m4.check(self.one, expect_dates=len(SCENES))
         self.assertEqual(res["problems"], [])
-        self.assertEqual(res["full"]["renders"], 5 * len(SCENES))
-        self.assertEqual(res["png_only"]["renders"], 5 * len(SCENES))
+        n_layers = len(check_m4.app_layers())             # слои — из LAYERS app.py, а не константой
+        self.assertEqual(res["full"]["renders"], n_layers * len(SCENES))
+        self.assertEqual(res["png_only"]["renders"], n_layers * len(SCENES))
         self.assertEqual(res["png_only"]["indices_tif_left"], 0)
 
 
