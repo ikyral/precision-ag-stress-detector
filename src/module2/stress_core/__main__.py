@@ -2,7 +2,8 @@
 
   python -m stress_core run <сцены> -o <папка>      серия сцен -> зоны, статистика, индексы
   python -m stress_core indices <scene.tif> -o <папка>   только NDVI.tif, NDRE.tif, MSAVI.tif, NDMI.tif
-  python -m stress_core update <data/scenes> -o <data>   только новые даты (для main_pipeline, КТ3)
+  python -m stress_core update <data/scenes> -o <data>   только новые даты (для main_pipeline, КТ3);
+                                                    --reprocess ДАТА ... — заново эти и более поздние даты
   python -m stress_core check <data>                проверка zones/stats/indices на контракт с M3 и M4
   python -m stress_core season <data>               маски и графики за сезон в <data>/season (КТ4)
   python -m stress_core demo -o <папка>             синтетическое поле и его обработка
@@ -15,9 +16,17 @@ from pathlib import Path
 
 from .early_stress import EarlyStressConfig
 from .indices import INDEX_NAMES, compute_indices
-from .pipeline import SENTINEL2_10_BAND_ORDER, load_scene, process_new_scenes, run_pipeline, save_index_rasters
+from .pipeline import (SENTINEL2_10_BAND_ORDER, load_scene, parse_date, process_new_scenes, run_pipeline,
+                       save_index_rasters)
 from .synthetic import write_demo_scenes
 from .zoning import ZoningConfig
+
+
+def _date(value: str) -> str:
+    try:
+        return parse_date(value)
+    except ValueError:
+        raise argparse.ArgumentTypeError(f"ожидается дата YYYY-MM-DD: {value}") from None
 
 
 def _classes(value: str) -> int | None:
@@ -64,9 +73,13 @@ def main(argv=None) -> int:
     idx.add_argument("scene", type=Path)
     _add_common(idx)
 
-    upd = sub.add_parser("update", help="обработать только новые сцены (уже обработанные даты пропускаются)")
+    upd = sub.add_parser("update",
+                         help="обработать только новые сцены (уже обработанные даты пропускаются, кроме --reprocess)")
     upd.add_argument("inputs", nargs="+", help="папка data/scenes или файлы сцен")
     upd.add_argument("--classes", type=_classes, default=3)
+    upd.add_argument("--reprocess", nargs="+", type=_date, metavar="ДАТА", default=[],
+                     help="обработать эти даты заново (например, сцену перекачали); более поздние уже "
+                          "обработанные даты пересчитываются тоже — их динамика зависит от предыдущей даты")
     _add_common(upd)
 
     chk = sub.add_parser("check", help="проверить результаты на контракт с M3 и M4")
@@ -115,8 +128,11 @@ def main(argv=None) -> int:
     zcfg = ZoningConfig(n_classes=args.classes)
     if args.cmd == "update":
         res = process_new_scenes(args.inputs, args.out, band_order=args.bands, scale=args.scale,
-                                 zoning_cfg=zcfg, early_cfg=EarlyStressConfig(), backend=args.backend)
-        print(f"новых дат: {len(res['processed'])} ({', '.join(res['processed']) or '—'}); "
+                                 zoning_cfg=zcfg, early_cfg=EarlyStressConfig(), backend=args.backend,
+                                 reprocess=args.reprocess)
+        new = [d for d in res["processed"] if d not in res["reprocessed"]]
+        print(f"новых дат: {len(new)} ({', '.join(new) or '—'}); "
+              f"переобработано: {len(res['reprocessed'])} ({', '.join(res['reprocessed']) or '—'}); "
               f"уже были: {len(res['skipped'])}; результаты: {res['out_dir']}")
         for d, err in res["errors"].items():
             print(f"  ОШИБКА {d}: {err}", file=sys.stderr)

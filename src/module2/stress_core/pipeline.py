@@ -603,13 +603,23 @@ def process_new_scenes(
     zoning_cfg: ZoningConfig | None = None,
     early_cfg: EarlyStressConfig | None = None,
     backend: str = "numpy",
+    reprocess: Sequence[str] | None = None,
 ) -> dict:
     """Обработать только новые сцены (точка входа для main_pipeline.py, КТ3).
 
     Сцены, для которых в out_dir уже есть zones и stats, пропускаются; динамика первой новой даты считается
     от ближайшей более ранней уже обработанной даты. Повторный вызов без новых снимков ничего не меняет.
     out_dir по умолчанию: для папки data/scenes это data/.
-    Возвращает {"processed": [...], "skipped": [...], "errors": {...}, "warnings": [...]}.
+
+    reprocess — даты YYYY-MM-DD, которые нужно обработать заново, даже если результат уже есть (например,
+    M1 перекачал сцену с --force). Динамика и правило decline зависят от предыдущей даты, поэтому вместе
+    с самой ранней из них пересчитываются и все более поздние уже обработанные даты: результат совпадает
+    с полным run. Если сцена новее своего stats-файла (вероятно, перекачана), выдаётся предупреждение,
+    но сама дата не переобрабатывается. Если переобработка даты упала, её прежние zones и stats остаются
+    на диске, а даты, сравнённые с её прежним результатом, перечисляются в warnings.
+    Возвращает {"processed": [...], "reprocessed": [...], "skipped": [...], "errors": {...}, "warnings": [...]};
+    processed — все даты, посчитанные в этом вызове (новые и переобработанные), reprocessed — те из них,
+    результат которых уже был.
     """
     inputs = [scenes] if isinstance(scenes, (str, Path)) else list(scenes)
     if out_dir is None:
@@ -618,29 +628,81 @@ def process_new_scenes(
     out_dir = Path(out_dir)
     found, warnings = collect_scenes(inputs)
     done = set(processed_dates(out_dir))
-    new = [(p, d) for p, d in found if d not in done]
-    skipped = sorted(d for _, d in found if d in done)
+    found_dates = {d for _, d in found}
+    asked = sorted({parse_date(d) for d in reprocess or []})
+    missing = [d for d in asked if d not in found_dates]
+    if missing:
+        warnings.append(f"даты {', '.join(missing)} указаны для переобработки, но их сцен нет во входных данных")
+    asked = [d for d in asked if d in found_dates]
+    cascade = [d for _, d in found if asked and d in done and d > asked[0] and d not in asked]
+    redo = set(asked) | set(cascade)
+    if asked:
+        parts = []
+        redone = [d for d in asked if d in done]  # даты из reprocess без результата считаются как новые
+        if redone:
+            parts.append(f"переобработка дат {', '.join(redone)}")
+        if cascade:
+            parts.append(f"динамика и правило decline зависят от предыдущей даты, поэтому пересчитаны и "
+                         f"обработанные даты позже {asked[0]}: {', '.join(cascade)}")
+        if parts:
+            warnings.append("; ".join(parts))
+        lost = sorted(d for d in done if d > asked[0] and d not in found_dates)
+        if lost:
+            warnings.append(
+                f"даты {', '.join(lost)} обработаны раньше, но их сцен нет во входных данных: их не пересчитать, "
+                f"динамика в них посчитана от прежней версии {asked[0]} и следующих дат — для точного ряда "
+                "перезапустите всю серию (stress_core run)"
+            )
+    new = [(p, d) for p, d in found if d not in done or d in redo]
+    skipped = sorted(d for _, d in found if d in done and d not in redo)
     if done and new:
         latest = max(done)
-        late = [d for _, d in new if d < latest]
+        late = [d for _, d in new if d < latest and d not in done and not (asked and d > asked[0])]
         if late:
             warnings.append(
                 f"даты {', '.join(late)} раньше уже обработанной {latest}: динамика более поздних дат посчитана "
                 "без них — для точного ряда перезапустите всю серию (stress_core run)"
             )
+    for p, d in found:
+        stats_path = out_dir / "stats" / f"index_stats_{d.replace('-', '_')}.json"
+        if d in skipped and p.stat().st_mtime > stats_path.stat().st_mtime:
+            warnings.append(
+                f"{p.name}: сцена новее результата {stats_path.name} (вероятно, перекачана) — результат мог "
+                f"устареть; обработать заново: stress_core update --reprocess {d}"
+            )
     for msg in warnings:
         print(f"предупреждение: {msg}", file=sys.stderr)
-    result = {"processed": [], "skipped": skipped, "errors": {}, "warnings": warnings, "out_dir": str(out_dir)}
+    result = {"processed": [], "reprocessed": [], "skipped": skipped, "errors": {}, "warnings": warnings,
+              "out_dir": str(out_dir)}
     if not new:
         return result
     summary = run_pipeline(
         [p for p, _ in new], out_dir, band_order=band_order, scale=scale, zoning_cfg=zoning_cfg,
         early_cfg=early_cfg, backend=backend, use_history=True,
     )
+    late_msgs = []
+    stale: dict[str, list[str]] = {}  # упавшая переобработка -> даты, сравнённые с её прежним результатом
     for _, d in new:
         rec = summary["dates"].get(d, {})
         if "error" in rec:
             result["errors"][d] = rec["error"]
+            if d in done:
+                late_msgs.append(f"{d}: переобработка не удалась, на диске остались прежние zones и stats (устарели)")
+                stale[d] = []
         else:
             result["processed"].append(d)
+            if d in done:
+                result["reprocessed"].append(d)
+            base = rec.get("early_stress", {}).get("compared_with")
+            if base in stale:  # run_pipeline взял историю с диска, т. е. прежние индексы упавшей даты
+                stale[base].append(d)
+    for d, deps in stale.items():
+        if deps:
+            late_msgs.append(
+                f"даты {', '.join(deps)} посчитаны от прежнего результата {d} (его переобработка не удалась): "
+                f"их динамика может не соответствовать новой сцене — исправьте сцену {d} и повторите --reprocess {d}"
+            )
+    for msg in late_msgs:  # предупреждения выше уже напечатаны, эти печатаем здесь же
+        print(f"предупреждение: {msg}", file=sys.stderr)
+    warnings.extend(late_msgs)
     return result
