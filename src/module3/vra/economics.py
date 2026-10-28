@@ -116,6 +116,13 @@ def calculate_economics(
             "quantity_unit": unit,
             "cost_rub": quantity * price,
         })
+    # Explicit unit-specific aliases keep the dashboard contract unambiguous.
+    report[f"base_rate_{unit}_ha"] = base
+    report[f"price_per_{unit}"] = price
+    for zone in report["zone_breakdown"]:
+        zone["rate_factor"] = zone["fertilizer_rate"] / base if base else None
+        if zone["rate_factor"] is not None and not math.isfinite(zone["rate_factor"]):
+            raise ValueError("The input values overflow the rate factor calculation")
     if not all(math.isfinite(v) for v in (total_area, uniform, smart, saved,
                                          uniform * price, smart * price, saved * price)):
         raise ValueError("The input values overflow the economic calculation")
