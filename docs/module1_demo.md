@@ -59,7 +59,7 @@ python3 -m venv .venv
 .venv/bin/python -m pip install -r src/module2/requirements.txt -r src/module3/requirements.txt \
     -r src/module4/requirements.txt
 .venv/bin/python main_pipeline.py --skip-fetch          # ~4 с, «код выхода 0»
-.venv/bin/streamlit run src/module4/app.py              # кабинет: http://localhost:8501
+.venv/bin/streamlit run src/module4/app.py              # кабинет: открыть http://localhost:8501
 ```
 
 ### Windows (PowerShell)
@@ -73,6 +73,10 @@ py -3 -m venv .venv
 .venv\Scripts\python.exe main_pipeline.py --skip-fetch
 .venv\Scripts\streamlit.exe run src\module4\app.py
 ```
+
+Все команды — **из корня репозитория**. Streamlit читает `.streamlit/config.toml` из текущей папки: с ним
+первый запуск не ждёт ввода email (`headless`), а кнопки Deploy нет. Из-за `headless` браузер сам не откроется:
+адрес `http://localhost:8501` откройте вручную.
 
 Кабинет сам находит папку `data/` вверх от `app.py`. Другую папку можно задать переменной `PAS_DATA_DIR`
 (`export PAS_DATA_DIR=/путь/data`, в PowerShell — `$env:PAS_DATA_DIR = "C:\путь\data"`) и выбрать её
