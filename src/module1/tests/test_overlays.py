@@ -188,7 +188,7 @@ class TestOverlays(unittest.TestCase):
         self.assertEqual(m["schema_version"], "1.1")
         self.assertEqual(m["hidden"]["label"], "Скрытый стресс (М2)")
         self.assertEqual(m["rgb"]["label"], "Снимок Sentinel-2 (RGB)")
-        self.assertEqual(m["rgb"]["legend_text"], "Sentinel-2 L2A, true color (B04, B03, B02)")
+        self.assertEqual(m["rgb"]["legend_text"], "Sentinel-2 L2A, true color (B04, B03, B02), усиление контраста")
         self.assertTrue(m["nodata_label"] and len(m["nodata_label"]) < 40)
         self.assertTrue(len(m["nodata_meaning"]) > len(m["nodata_label"]))
         for key in ("bounds", "index_ranges", "colormaps", "alpha", "nodata_mode", "nodata_color", "nodata_meaning",
@@ -336,6 +336,20 @@ class TestOverlays(unittest.TestCase):
             p.write_text(json.dumps({"date": DATES[0], **_stats(0.0, 0.9)}), encoding="utf-8")
             self.assertEqual(ov.build_overlays(data)["status"], "written")   # шкала изменилась — все PNG заново
             self.assertFalse(np.array_equal(before, read_png(png)))
+
+    def test_legend_text_in_fingerprint(self):
+        """Новая подпись легенды обновляет meta.json обычным запуском (git pull + --skip-fetch), без --rebuild."""
+        from unittest import mock
+
+        with tempfile.TemporaryDirectory() as d:
+            data = Path(d)
+            make_dataset(data)
+            self.assertEqual(ov.build_overlays(data)["status"], "written")
+            self.assertEqual(ov.build_overlays(data)["status"], "unchanged")
+            with mock.patch.object(ov, "RGB_LEGEND_TEXT", "другая подпись"):
+                self.assertEqual(ov.build_overlays(data)["status"], "written")
+            meta = json.loads((data / "overlays" / "meta.json").read_text(encoding="utf-8"))
+            self.assertEqual(meta["rgb"]["legend_text"], "другая подпись")
 
     def test_unreadable_scene_of_skipped_date_does_not_break_layers(self):
         """Сцена даты, упавшей в М2 (её слои не рисуются), не читается: остальные даты рисуются, растяжка RGB — без неё."""

@@ -59,7 +59,7 @@ PNG строятся на сетке **EPSG:3857** (Leaflet растягивае
 | `nodata_mode`, `nodata_color`, `nodata_meaning` | нет | облако/тень внутри поля: `gray` → `[128,128,128,150]` (по умолчанию) или `transparent`; вне поля всегда alpha 0. `nodata_meaning` — длинное пояснение, не для легенды |
 | `nodata_label`, `nodata_css` | легенда (1.1) | короткая подпись «Нет данных (облако/тень)» и CSS того же цвета: `rgba(128, 128, 128, 0.588)` (`transparent` → `rgba(0, 0, 0, 0)`) |
 | `rgb` | нет | true color B04, B03, B02, alpha 255. Растяжка одна на три канала и на сезон: `min_reflectance`/`max_reflectance` — перцентили `percentiles` (2, 98) отражения всех трёх каналов по пикселям поля всех дат (`season_dates`); `gamma` 1.3; `formula` — как считается пиксель. Превью М1 (`scenes/preview`) растягивается по-старому (0…0.18, гамма 1.6) |
-| `rgb.label`, `rgb.legend_text` | легенда (1.1) | «Снимок Sentinel-2 (RGB)» и «Sentinel-2 L2A, true color (B04, B03, B02)» |
+| `rgb.label`, `rgb.legend_text` | легенда (1.1) | «Снимок Sentinel-2 (RGB)» и «Sentinel-2 L2A, true color (B04, B03, B02), усиление контраста» (подписи входят в `inputs_sha256`: новая подпись перерисовывает слои) |
 | `hidden` | нет | слой HIDDEN: 1 — цвет `[231,76,60,235]`, 0 — прозрачно, 255 в поле — `nodata_color` |
 | `hidden.label`, `hidden.css` | легенда (1.1) | «Скрытый стресс (М2)» и `rgba(231, 76, 60, 0.922)` |
 | `schema_version`, `generated_at`, `generator` | нет | версия схемы (`1.1`), время, кто записал |
