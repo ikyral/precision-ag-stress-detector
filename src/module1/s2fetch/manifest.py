@@ -2,9 +2,20 @@
 from __future__ import annotations
 
 import json
+import os
 from pathlib import Path
 
 NAME = "scenes_manifest.json"
+
+
+def rel_path(path: Path, out_dir: Path) -> str:
+    """Путь для манифеста: относительно его папки, разделитель «/» на всех ОС (манифест лежит в git).
+    Если относительного пути нет (другой диск Windows) — абсолютный."""
+    target = Path(path).resolve()
+    try:
+        return Path(os.path.relpath(target, Path(out_dir).resolve())).as_posix()
+    except ValueError:
+        return target.as_posix()
 
 
 def load(out_dir: Path) -> dict:

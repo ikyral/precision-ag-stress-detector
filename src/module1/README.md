@@ -110,7 +110,8 @@ PowerShell — то же с `..\..\.venv\Scripts\python.exe`; перенос с�
 `data/scenes/scenes_manifest.json` — параметры запуска, сетка и по каждой найденной дате: id L2A и L1C,
 доли (`invalid_percent`, `scl_cloud_percent`, `union_cloud_percent`, `manual_mask_percent`,
 `nan_percent`), принята/выбрана, причина, статус. Записи дат вне текущего интервала из прошлых
-запусков сохраняются.
+запусков сохраняются. Пути `boundary` и `manual_masks` записываются относительно папки манифеста, с «/»
+(абсолютные — только если относительного пути нет, например контур на другом диске Windows).
 
 `data/scenes/preview/scene_YYYY_MM_DD.png` — RGB | NDVI | маска (жёлтый — SCL, пурпурный —
 s2cloudless, оранжевый — ручная маска, голубой — расширение), `all_dates.png` — все даты. В git не
