@@ -113,14 +113,18 @@ class TestCli(unittest.TestCase):
                          {1: 160.0, 2: 90.0, 3: 0.0})
 
     def test_skip_fetch_does_not_import_fetch_deps(self):
-        """--skip-fetch не тянет pystac-client, s2cloudless и dotenv (коллеги без ключей CDSE)."""
+        """--skip-fetch и проверка пакетов М2–М4 не тянут пакеты скачивания М1 (у коллег стоят только М2–М4):
+        ни импортом, ни транзитивно; при заблокированных пакетах М1 check_deps проходит."""
+        fetch = ("pystac_client", "s2cloudless", "dotenv", "lightgbm", "sentinelhub", "cv2", "s2fetch.pipeline")
         code = ("import sys, main_pipeline as mp; a = mp.parse_args(['--skip-fetch']); "
-                "r = mp.Report(a, mp.ROOT); mp.stage_fetch(a, mp.ROOT, r); "
-                "print(sorted(m for m in ('pystac_client', 's2cloudless', 'dotenv', 's2fetch.pipeline') "
-                "if m in sys.modules))")
+                "r = mp.Report(a, mp.ROOT); mp.stage_fetch(a, mp.ROOT, r); deps = mp.check_deps(); "
+                f"print(deps, sorted(m for m in {fetch!r} if sys.modules.get(m) is not None))")
+        blocked = "import sys; sys.modules.update({m: None for m in %r}); " % (fetch,)
         import subprocess
-        out = subprocess.run([sys.executable, "-c", code], cwd=ROOT, capture_output=True, text=True, check=True)
-        self.assertEqual(out.stdout.strip(), "[]")
+        for prefix in ("", blocked):
+            out = subprocess.run([sys.executable, "-c", prefix + code], cwd=ROOT, capture_output=True, text=True,
+                                 check=True)
+            self.assertEqual(out.stdout.strip(), "None []", prefix or "без блокировки")
 
 
 class TestFetchUnavailable(unittest.TestCase):
@@ -141,7 +145,9 @@ class TestFetchUnavailable(unittest.TestCase):
             st.enter_context(mock.patch.object(s2fetch.reader, "ROOT", tmp))  # .env ищется в пустой папке
             st.enter_context(mock.patch.object(s2fetch.pipeline, "fetch_series",
                                                side_effect=AssertionError("fetch_series вызван: сеть")))
-            # остальные этапы не нужны: код выхода и ошибки — только от М1
+            # остальные этапы не нужны: код выхода и ошибки — только от М1 (check_deps внутри patch.dict(sys.modules)
+            # импортировал бы М2–М4, а выход из patch.dict выгрузил бы их: повторная загрузка numpy падает)
+            st.enter_context(mock.patch.object(mp, "check_deps", return_value=None))
             st.enter_context(mock.patch.object(mp, "stage_m2", return_value=([], set())))
             st.enter_context(mock.patch.object(mp, "stage_m3", return_value=([], set())))
             st.enter_context(mock.patch.object(mp, "stage_layers", return_value=None))
@@ -159,6 +165,32 @@ class TestFetchUnavailable(unittest.TestCase):
         self.assertNotIn("Traceback", out)
         self.assertEqual(out.count(expected), 1, out)
         self.assertNotIn("\n", expected)
+
+    def test_missing_m2_m4_packages(self):
+        """Нет пакета для М2–М4: одна строка-подсказка, код 1, этапы не запускаются, файлы не пишутся."""
+        from unittest import mock
+
+        tmp = Path(tempfile.mkdtemp(prefix="pas_deps_"))
+        self.addCleanup(shutil.rmtree, tmp, ignore_errors=True)
+        out = io.StringIO()
+        with contextlib.ExitStack() as st:
+            st.enter_context(mock.patch.dict(sys.modules, {"numpy": None}))
+            for name in ("stage_fetch", "stage_m2", "stage_m3", "stage_layers", "run_checks"):
+                st.enter_context(mock.patch.object(mp, name, side_effect=AssertionError(f"{name} вызван")))
+            st.enter_context(contextlib.redirect_stdout(out))
+            st.enter_context(contextlib.redirect_stderr(out))
+            code = mp.main(["--skip-fetch", "--data-dir", str(tmp / "data")])
+        expected = f"нет модуля numpy: {mp.PIPELINE_DEPS_HINT}"
+        self.assertEqual(code, 1)
+        self.assertNotIn("Traceback", out.getvalue())
+        self.assertEqual(out.getvalue().strip().splitlines(), [f"main_pipeline: {expected}"])
+        self.assertIn(".venv/bin/python", expected)
+        self.assertIn("pip install -r src/module2/requirements.txt", expected)
+        self.assertEqual(list(tmp.iterdir()), [])                     # ни папки данных, ни отчёта, ни состояния
+
+    def test_pipeline_modules_importable(self):
+        """Список PIPELINE_MODULES без опечаток: в .venv всё импортируется."""
+        self.assertIsNone(mp.check_deps())
 
     def test_missing_m1_packages(self):
         code, rep, out = self._run({"pystac_client": None}, {})
