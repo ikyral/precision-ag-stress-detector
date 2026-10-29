@@ -302,9 +302,9 @@ def fetch_series(opt: Options) -> tuple[int, list[DateResult]]:
 
     run_info = {
         "generated": dt.datetime.now(dt.timezone.utc).isoformat(timespec="seconds"),
-        "boundary": str(opt.boundary), "interval": [opt.start, opt.end], "tile": opt.tile,
+        "boundary": manifest.rel_path(opt.boundary, opt.out), "interval": [opt.start, opt.end], "tile": opt.tile,
         "max_cloud_percent": opt.max_cloud, "weekly": opt.weekly, "dilate_px": opt.dilate_px,
-        "manual_masks": str(opt.manual_masks) if manual_polys else None,
+        "manual_masks": manifest.rel_path(opt.manual_masks, opt.out) if manual_polys else None,
         "rule": "отброс, если SCL 0/1 > max (нет покрытия) или SCL{3,8,9,10} ∪ s2cloudless ∪ manual > max "
                 "(без расширения); NaN = расширенная маска облаков ∪ SCL 0/1 внутри поля, 0 = вне поля",
         "grid": {"crs": grid.crs, "transform": list(grid.transform)[:6],

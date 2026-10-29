@@ -1,13 +1,14 @@
 """Сквозной конвейер КТ3: спутник (М1) -> индексы и зоны (М2) -> предписания VRA (М3) -> слои для кабинета (М4).
 
-Запуск из корня репозитория (Linux/macOS — .venv/bin/python, Windows — .venv\\Scripts\\python.exe):
+Запуск из корня репозитория (Windows — .venv\\Scripts\\python.exe вместо .venv/bin/python):
 
-    python main_pipeline.py --start 2026-06-29 --end 2026-08-30        # скачать новые сцены и обработать
-    python main_pipeline.py --skip-fetch                                # без скачивания: то, что есть в data/scenes
+    .venv/bin/python main_pipeline.py --start 2026-06-29 --end 2026-08-30   # скачать новые сцены и обработать
+    .venv/bin/python main_pipeline.py --skip-fetch                           # без скачивания: то, что есть в data/scenes
 
 Каждая новая дата проходит М1 -> М2 -> М3, затем перерисовываются слои (PNG) всех дат. Повторный запуск без
 новых снимков меняет только pipeline_report.json. Дата, упавшая на одном этапе, дальше не идёт; остальные
-даты обрабатываются. Код выхода: 0 — ок, 1 — ошибки обработки, 2 — данные есть, но проверки не прошли.
+даты обрабатываются. Код выхода: 0 — ок, 1 — ошибки обработки, 2 — данные есть, но проверки не прошли. Без пакетов М2–М4 (не через
+.venv) — одна строка-подсказка и код 1 до запуска этапов, файлы не трогаются.
 
 Состояние <data>/pipeline_state.json: sha256 сцены, по которой М2 считал дату, и маски зон, по которой М3
 строил предписание. Если сцену подменили (например, s2fetch --force) или пришла дата раньше уже обработанных,
@@ -20,6 +21,7 @@ from __future__ import annotations
 import argparse
 import datetime as dt
 import hashlib
+import importlib
 import json
 import math
 import re
@@ -45,6 +47,12 @@ COVER_TOLERANCE_M = 10.0  # рамка предписаний строится �
 FETCH_KEYS_HINT = "Без ключей CDSE используйте --skip-fetch."
 FETCH_DEPS_HINT = ("Для скачивания нужны зависимости М1: pip install -r src/module1/requirements.txt. "
                    + FETCH_KEYS_HINT)
+PIPELINE_DEPS_HINT = (r"запустите через .venv/bin/python (Windows: .venv\Scripts\python.exe) или установите "
+                      "зависимости: pip install -r src/module2/requirements.txt -r src/module3/requirements.txt "
+                      "-r src/module4/requirements.txt")
+# всё, что импортируют этапы М2, М3, слои и проверки; пакеты скачивания М1 сюда не входят (их проверяет stage_fetch)
+PIPELINE_MODULES = ("numpy", "rasterio", "pyproj", "shapely", "pyogrio", "PIL", "stress_core.pipeline",
+                    "stress_core.contract", "vra", "vra.batch", "s2fetch.overlays", "s2fetch.grid")
 # формулировки предупреждений process_new_scenes М2 (машинного кода у них нет; тест упадёт, если М2 их сменит)
 M2_SCENE_NEWER_RE = re.compile(r"^scene_(\d{4})_(\d{2})_(\d{2})\.tif: сцена новее результата ")
 M2_EARLIER_RE = re.compile(r"^даты (\d{4}-\d{2}-\d{2}(?:, \d{4}-\d{2}-\d{2})*) раньше уже обработанной "
@@ -97,6 +105,20 @@ def _rates_arg(text: str) -> dict[int, float]:
         return rates
     except ValueError as exc:
         raise argparse.ArgumentTypeError("нужно 1=150,2=80,3=0 (каждый класс один раз)") from exc
+
+
+def check_deps() -> str | None:
+    """Одна строка-подсказка, если не хватает пакетов для М2–М4, слоёв или проверок; None — всё есть.
+
+    Проверка до запуска этапов: без пакетов ничего не пишется, pipeline_report.json и pipeline_state.json
+    остаются от прошлого запуска и по-прежнему описывают данные.
+    """
+    for name in PIPELINE_MODULES:
+        try:
+            importlib.import_module(name)
+        except ImportError as exc:
+            return f"{f'нет модуля {exc.name}' if exc.name else exc}: {PIPELINE_DEPS_HINT}"
+    return None
 
 
 class Report:
@@ -639,6 +661,10 @@ def main(argv=None) -> int:
         if hasattr(stream, "reconfigure"):
             stream.reconfigure(encoding="utf-8", errors="replace")
     args = parse_args(argv)
+    missing = check_deps()
+    if missing:  # без трейсбека: одна строка с подсказкой, файлы не трогаем
+        print(f"main_pipeline: {missing}", file=sys.stderr)
+        return 1
     data = args.data_dir.resolve()
     data.mkdir(parents=True, exist_ok=True)
     rep = Report(args, data)

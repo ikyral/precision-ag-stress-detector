@@ -290,6 +290,21 @@ class TestManifest(unittest.TestCase):
             manifest.save(Path(d), {"generated": "t3", "weekly": False}, entry, manifest.load(Path(d)))
             self.assertIn('"generated": "t3"', p.read_text(encoding="utf-8"))
 
+    def test_rel_path_posix_and_absolute_fallback(self):
+        """Пути в манифесте — от его папки, с «/»; без относительного пути (другой диск Windows) — абсолютный."""
+        from unittest import mock
+
+        from s2fetch import manifest
+
+        out = ROOT / "data" / "scenes"
+        self.assertEqual(manifest.rel_path(SAMPLES / "field_boundary.geojson", out),
+                         "../samples/field_boundary.geojson")
+        self.assertEqual(manifest.rel_path(manual.DEFAULT_PATH, out), "../../src/module1/manual_masks.geojson")
+        with mock.patch("os.path.relpath", side_effect=ValueError("path is on mount 'D:'")):
+            got = manifest.rel_path(manual.DEFAULT_PATH, out)
+        self.assertEqual(got, manual.DEFAULT_PATH.resolve().as_posix())
+        self.assertTrue(Path(got).is_absolute())
+
 
 class TestFetchSeries(unittest.TestCase):
     def test_run_returns_code_fetch_series_returns_results(self):

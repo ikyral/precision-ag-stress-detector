@@ -9,7 +9,7 @@
   "max_cloud_percent": 10.0,
   "weekly": true,
   "dilate_px": 2,
-  "manual_masks": "/mnt/data/precision-ag-stress-detector/src/module1/manual_masks.geojson",
+  "manual_masks": "../../src/module1/manual_masks.geojson",
   "rule": "отброс, если SCL 0/1 > max (нет покрытия) или SCL{3,8,9,10} ∪ s2cloudless ∪ manual > max (без расширения); NaN = расширенная маска облаков ∪ SCL 0/1 внутри поля, 0 = вне поля",
   "grid": {
     "crs": "EPSG:32637",
