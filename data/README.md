@@ -2,11 +2,11 @@
 
 Цепочка: М1 (`scenes/`) → М2 (`zones/`, `stats/`, `indices/`, `hidden_stress/`) → М3 (`prescriptions/`) →
 М1 (`overlays/` для кабинета) → М4 (читает всё это). Целиком её запускает `main_pipeline.py` из корня
-репозитория:
+репозитория, через Python из `.venv` (Windows: `.venv\Scripts\python.exe`):
 
 ```bash
-python main_pipeline.py --skip-fetch                          # по сценам, которые уже лежат в data/scenes
-python main_pipeline.py --start 2026-06-29 --end 2026-08-30   # сначала докачать новые сцены (ключи CDSE в .env)
+.venv/bin/python main_pipeline.py --skip-fetch                          # по сценам, которые уже лежат в data/scenes
+.venv/bin/python main_pipeline.py --start 2026-06-29 --end 2026-08-30   # сначала докачать новые сцены (ключи CDSE в .env)
 ```
 
 ## Раскладка `data/` после конвейера
@@ -30,10 +30,10 @@ python main_pipeline.py --start 2026-06-29 --end 2026-08-30   # сначала �
 | `overlays/overlay_check.html` | М1 `tools/overlay_map.py` | нет | карта для проверки совмещения в браузере |
 | `field_boundary.geojson` | `main_pipeline` | нет | копия контура для М4, только если `--data-dir` не `data/` |
 | `pipeline_state.json` | `main_pipeline` | нет | sha256 сцен и масок зон, по которым считали М2 и М3 |
-| `pipeline_report.json` | `main_pipeline` | нет | отчёт последнего запуска (схема 1.1): этапы, даты, `errors`, `warnings`, `info` (предупреждения М2, ложные по sha256, с пояснением), проверки (в т. ч. `crs_audit`: CRS и площади выходов М3 против сетки сцен), время |
+| `pipeline_report.json` | `main_pipeline` | нет | отчёт последнего запуска (схема 1.1): этапы, даты, `errors`, `warnings`, `info` (предупреждения М2, ложные по sha256, с пояснением), проверки (в т. ч. `crs_audit`: CRS и площади выходов М3 против сетки сцен), время. М4 показывает `errors`: даты и этапы с ошибкой. Без пакетов М2–М4 запуск останавливается до этапов и отчёт не перезаписывает |
 
 В git лежат только `samples/`, `scenes/*.tif`, `scenes/scenes_manifest.json` и этот файл (см. `.gitignore`).
-Всё остальное воспроизводится командой `python main_pipeline.py --skip-fetch` примерно за 4 с.
+Всё остальное воспроизводится командой `.venv/bin/python main_pipeline.py --skip-fetch` примерно за 4 с.
 
 ## М1 → М2: `scenes/scene_YYYY_MM_DD.tif`
 
@@ -55,12 +55,13 @@ PNG строятся на сетке **EPSG:3857** (Leaflet растягивае
 | `index_ranges` | да | `{NDVI, NDRE, MSAVI, NDMI: [lo, hi]}` — шкала, по которой окрашены PNG; формула `season_ranges` М4: по всем `stats/index_stats_*.json` `lo=min(p5)`, `hi=max(p95)`, `pad=0.05·(hi−lo)`, `(round(lo−pad,3), round(hi+pad,3))` |
 | `field_name` | да | **не пишется**: имя поля берётся из `field_boundary.geojson` |
 | `colormaps` | нет | палитры `CMAP_VEG` (NDVI, NDRE, MSAVI) и `CMAP_WATER` (NDMI) из `app.py`: `[[доля, [r, g, b]], ...]` |
-| `alpha` | нет | 235 — альфа индексов и HIDDEN внутри поля (как `colorize` в М4); М4 добавляет `opacity=0.85` слоя |
-| `nodata_mode`, `nodata_color`, `nodata_meaning` | нет | облако/тень внутри поля: `gray` → `[128,128,128,150]` (по умолчанию) или `transparent`; вне поля всегда alpha 0. `nodata_meaning` — длинное пояснение, не для легенды |
+| `alpha` | нет | 235 — альфа индексов и HIDDEN внутри поля (как `colorize` в М4). PNG М4 накладывает с `opacity=1` (альфа уже в пикселях); `opacity=0.85` — только у `indices/*.tif`, когда PNG нет |
+| `nodata_mode` | легенда | облако/тень внутри поля: `gray` (по умолчанию) или `transparent`; вне поля всегда alpha 0. При `transparent` М4 не рисует в легенде квадрат «нет данных» |
+| `nodata_color`, `nodata_meaning` | `nodata_color` — запасной цвет легенды | `gray` → `[128,128,128,150]`, `transparent` → `[0,0,0,0]`; М4 берёт его, если нет `nodata_css` (схема 1.0). `nodata_meaning` — длинное пояснение, не для легенды, М4 не читает |
 | `nodata_label`, `nodata_css` | легенда (1.1) | короткая подпись «Нет данных (облако/тень)» и CSS того же цвета: `rgba(128, 128, 128, 0.588)` (`transparent` → `rgba(0, 0, 0, 0)`) |
 | `rgb` | нет | true color B04, B03, B02, alpha 255. Растяжка одна на три канала и на сезон: `min_reflectance`/`max_reflectance` — перцентили `percentiles` (2, 98) отражения всех трёх каналов по пикселям поля всех дат (`season_dates`); `gamma` 1.3; `formula` — как считается пиксель. Превью М1 (`scenes/preview`) растягивается по-старому (0…0.18, гамма 1.6) |
-| `rgb.label`, `rgb.legend_text` | легенда (1.1) | «Снимок Sentinel-2 (RGB)» и «Sentinel-2 L2A, true color (B04, B03, B02), усиление контраста» (подписи входят в `inputs_sha256`: новая подпись перерисовывает слои) |
-| `hidden` | нет | слой HIDDEN: 1 — цвет `[231,76,60,235]`, 0 — прозрачно, 255 в поле — `nodata_color` |
+| `rgb.label`, `rgb.legend_text` | `legend_text` — легенда (1.1); `label` М4 не читает (подпись радио — из `LAYERS` `app.py`) | «Снимок Sentinel-2 (RGB)» и «Sentinel-2 L2A, true color (B04, B03, B02), усиление контраста» (подписи входят в `inputs_sha256`: новая подпись перерисовывает слои) |
+| `hidden` | `hidden.color` — запасной цвет легенды | слой HIDDEN: 1 — цвет `[231,76,60,235]`, 0 — прозрачно, 255 в поле — `nodata_color` |
 | `hidden.label`, `hidden.css` | легенда (1.1) | «Скрытый стресс (М2)» и `rgba(231, 76, 60, 0.922)` |
 | `schema_version`, `generated_at`, `generator` | нет | версия схемы (`1.1`), время, кто записал |
 | `render_crs`, `render_grid` | нет | `EPSG:3857`; размер PNG, шаг (м), `bounds_3857`, `oversample`, метод |
@@ -70,9 +71,12 @@ PNG строятся на сетке **EPSG:3857** (Leaflet растягивае
 | `sources` | нет | `{дата: {scene, zones, indices, hidden_stress}}` — входные файлы (пути от `data/`) |
 | `inputs_sha256` | нет | отпечаток входов и параметров: если он не изменился, PNG не перерисовываются |
 
-Шкала зависит от всех дат, поэтому при новой дате перерисовываются все PNG. М4 берёт PNG вместо
-`indices/*.tif`, если есть `overlays/{INDEX}_{YYYY_MM_DD}.png` и `meta.bounds`. Слои RGB и HIDDEN М4 пока
-не показывает (готовит в PR `module4-data-checks`).
+Шкала зависит от всех дат, поэтому при новой дате перерисовываются все PNG. В кабинете 7 слоёв (`LAYERS` в
+`src/module4/app.py`): карта предписаний VRA (полигоны М3), RGB, HIDDEN и четыре индекса. Для индексов М4 берёт PNG
+вместо `indices/*.tif`, если есть `overlays/{INDEX}_{YYYY_MM_DD}.png` и `meta.bounds`, а шкалу легенды — из
+`meta.index_ranges`; без PNG рисует `indices/*.tif` с `opacity=0.85`. RGB и HIDDEN есть только готовыми PNG
+(`PNG_ONLY_LAYERS`): без них кабинет просит запустить `main_pipeline.py`. Подписи этих слоёв в легенде — из
+`meta.json`, в `app.py` только запасные.
 
 Легенда (схема 1.1, только добавления к 1.0): `*_css` — тот же цвет, которым закрашены пиксели PNG
 (`rgba(r, g, b, alpha/255)`, альфа с 3 знаками), без `opacity` слоя: для PNG М4 ставит `opacity=1`. Цвета и
